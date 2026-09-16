@@ -193,6 +193,32 @@ h1 {
   display: grid;
   place-items: center;
   margin-bottom: 6px;
+  transition: height 260ms ease, margin-bottom 260ms ease;
+}
+
+/* Once the scan has results the hero gives up most of its height, so the first
+   TV lands above the fold instead of below it. */
+.radar.compact {
+  height: 76px;
+  margin-bottom: 2px;
+}
+.radar.compact .radar-core {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+}
+.radar.compact .radar-core .msr {
+  font-size: 24px;
+}
+.radar.compact .ring {
+  width: 68px;
+  height: 68px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .radar {
+    transition: none;
+  }
 }
 .ring {
   position: absolute;
@@ -209,6 +235,7 @@ h1 {
   width: 92px;
   height: 92px;
   border-radius: 26px;
+  transition: width 260ms ease, height 260ms ease, border-radius 260ms ease;
   background: var(--surface);
   border: 1px solid var(--line);
   display: grid;
@@ -425,6 +452,18 @@ input:focus-visible {
 .manual-actions {
   display: flex;
   gap: 10px;
+}
+
+/* A device row that offers a choice (connect vs pair, or several ports) puts
+   its buttons on their own line -- two of them never fit beside the name and
+   address at 384px, and squeezing them in wraps the name mid-word. */
+.device.choices {
+  flex-wrap: wrap;
+}
+.device.choices .manual-actions {
+  width: 100%;
+  flex-wrap: wrap;
+  padding-left: 58px;
 }
 
 /* Pair header */

@@ -3,7 +3,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { api } from "$lib/api";
   import appFilesCatalog from "$lib/app-files-catalog.json";
-  import type { Device, FileEntry } from "$lib/types";
+  import type { Device, FileEntry, FindResult } from "$lib/types";
 
   let { serial }: { serial: string } = $props();
 
@@ -17,8 +17,10 @@
   let powerUserPaths = $state(false);
   let filesBusy = $state<string | null>(null); // entry name currently being acted on
   let filesMessage = $state("");
-  /// package → found backup-file paths (null until that app was searched).
-  let appFilesResults = $state<Record<string, string[] | null>>({});
+  /// catalog id → search result (null until that app was searched). Keyed by
+  /// the catalog's own id, not the package name, so the rows stay stable if a
+  /// package id is corrected.
+  let appFilesResults = $state<Record<string, FindResult | null>>({});
   let appFilesBusy = $state<string | null>(null);
   let filesRequest = 0;
   /// File name the "copy to another device" picker is open for, plus targets.
@@ -137,10 +139,10 @@
   }
 
   async function findAppFiles(entry: (typeof appFilesCatalog)[number]) {
-    appFilesBusy = entry.package;
+    appFilesBusy = entry.id;
     filesMessage = "";
     try {
-      appFilesResults[entry.package] = await api.findFiles(serial, entry.search_dirs, entry.pattern);
+      appFilesResults[entry.id] = await api.findFiles(serial, entry.search_dirs, entry.pattern);
     } catch (e) {
       filesMessage = String(e);
     } finally {
@@ -221,7 +223,7 @@
       this computer. To restore later: browse to the folder below and use <strong>Upload here</strong>,
       then import it in the app.
     </p>
-    {#each appFilesCatalog as entry (entry.package)}
+    {#each appFilesCatalog as entry (entry.id)}
       <div class="app-backup-row">
         <div>
           <div class="apk-name">{entry.name}</div>
@@ -232,14 +234,24 @@
           onclick={() => findAppFiles(entry)}
           disabled={appFilesBusy !== null}
         >
-          {appFilesBusy === entry.package ? "Searching…" : "Find backup files"}
+          {appFilesBusy === entry.id ? "Searching…" : "Find backup files"}
         </button>
       </div>
-      {#if appFilesResults[entry.package]}
-        {@const found = appFilesResults[entry.package] ?? []}
-        {#if found.length === 0}
+      {#if appFilesResults[entry.id]}
+        {@const result = appFilesResults[entry.id]}
+        {@const found = result?.hits ?? []}
+        {@const unsearched = result?.unsearched ?? []}
+        {#if unsearched.length > 0}
+          <!-- The search never ran against these, so "no matches" would be a
+               claim we cannot make. Say what actually happened instead. -->
+          <p class="muted small found-list">
+            Couldn't search {unsearched.join(", ")} — the TV didn't answer. Check the
+            connection and try again.
+          </p>
+        {/if}
+        {#if found.length === 0 && unsearched.length === 0}
           <p class="muted small found-list">No matches — export from the app first, then search again.</p>
-        {:else}
+        {:else if found.length > 0}
           <ul class="found-list">
             {#each found as path (path)}
               <li>

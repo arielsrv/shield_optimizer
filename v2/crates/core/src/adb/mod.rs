@@ -15,5 +15,6 @@ pub use parse::{
     parse_permission_granted, parse_proc_stat, parse_storage_info, parse_thermal_max_celsius,
     parse_total_pss_by_process, parse_usage_stats, AppUsage, CpuSample, DisplayMode, FileEntry,
     NetSample, RamInfo, StorageInfo,
+    parse_mdns_services, MdnsService, MDNS_SERVICE_CONNECT, MDNS_SERVICE_LEGACY, MDNS_SERVICE_PAIRING,
 };
 pub use remote_input::RemoteInputSession;

@@ -283,6 +283,18 @@ fn validate_find_pattern(pattern: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Serialize)]
+pub struct FindResult {
+    /// Matching file paths, capped at 100.
+    pub hits: Vec<String>,
+    /// Directories the search could not be run against at all, because the ADB
+    /// call itself failed. A directory that simply does not exist is *not*
+    /// listed here — that is a real "no matches". Without this split, a
+    /// dropped connection rendered as "export from the app first", telling the
+    /// user to redo something that had worked (GitHub #86).
+    pub unsearched: Vec<String>,
+}
+
 /// `find_files` — locate files matching a name pattern under one or more
 /// `/sdcard` directories. Powers the app-backup finder (e.g. Projectivy's
 /// `*.plbackup` exports land wherever the user's file picker put them).
@@ -292,19 +304,24 @@ pub async fn find_files(
     serial: String,
     dirs: Vec<String>,
     pattern: String,
-) -> Result<Vec<String>, String> {
+) -> Result<FindResult, String> {
     validate_find_pattern(&pattern)?;
     let adb = state.adb_snapshot().await;
     let mut hits = Vec::new();
+    let mut unsearched = Vec::new();
     for dir in dirs {
         let dir = validate_sdcard_path(&dir)?;
-        // Errors (missing dir, permission) are expected for some candidates —
-        // suppress them; an empty result is the honest answer.
+        // A missing directory or a permission denial is expected for some
+        // candidates, and `find` reports those on stderr — suppress them, since
+        // an empty result is the honest answer. A failure of the ADB call
+        // itself is different: nothing was searched, so it must not be
+        // reported as "nothing found".
         let cmd = format!(
             "find {} -maxdepth 4 -type f -name '{pattern}' 2>/dev/null",
             quote_path(&dir)
         );
         let Ok(out) = adb.shell(&serial, &cmd).await else {
+            unsearched.push(dir);
             continue;
         };
         for line in out.stdout.lines() {
@@ -317,7 +334,7 @@ pub async fn find_files(
             }
         }
     }
-    Ok(hits)
+    Ok(FindResult { hits, unsearched })
 }
 
 #[cfg(test)]

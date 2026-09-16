@@ -20,6 +20,95 @@ pub struct DeviceListEntry {
     pub connection: ConnectionType,
 }
 
+/// A service advertised over mDNS and reported by `adb mdns services`.
+///
+/// Android 11+ wireless debugging listens on a *random* port that changes
+/// every time it is toggled, and advertises that port over mDNS. Pairing and
+/// connecting are separate services on separate ports — which is why guessing
+/// `:5555` cannot reach a modern device (GitHub #88).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdnsService {
+    /// Service instance name, e.g. `adb-58040DLCH005YV-jBeCEe`.
+    pub instance: String,
+    /// Service type, e.g. `_adb-tls-connect._tcp`.
+    pub service: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// `_adb._tcp` — legacy network debugging, no pairing code (the Shield path).
+pub const MDNS_SERVICE_LEGACY: &str = "_adb._tcp";
+/// `_adb-tls-connect._tcp` — the Android 11+ endpoint to `adb connect` to.
+pub const MDNS_SERVICE_CONNECT: &str = "_adb-tls-connect._tcp";
+/// `_adb-tls-pairing._tcp` — the Android 11+ endpoint to `adb pair` against.
+pub const MDNS_SERVICE_PAIRING: &str = "_adb-tls-pairing._tcp";
+
+impl MdnsService {
+    /// `host:port`, ready to hand to `adb connect` / `adb pair`.
+    pub fn endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Can this be connected to directly? True for legacy `_adb._tcp` and for
+    /// an already-paired `_adb-tls-connect._tcp`.
+    pub fn is_connectable(&self) -> bool {
+        self.service == MDNS_SERVICE_LEGACY || self.service == MDNS_SERVICE_CONNECT
+    }
+
+    /// Is this the pairing endpoint, which needs a code from the TV first?
+    pub fn is_pairing(&self) -> bool {
+        self.service == MDNS_SERVICE_PAIRING
+    }
+}
+
+/// Parse `adb mdns services` output.
+///
+/// Sample input (tab-separated in real output):
+/// ```text
+/// List of discovered mdns services
+/// adb-58040DLCH005YV-jBeCEe   _adb-tls-connect._tcp   192.168.42.211:41541
+/// adb-0323716101827           _adb._tcp               192.168.42.71:5555
+/// ```
+///
+/// Rows that are malformed, carry no port, or name a service we do not
+/// understand are dropped rather than guessed at — a wrong endpoint here is
+/// indistinguishable to the user from a device that is not there.
+pub fn parse_mdns_services(output: &str) -> Vec<MdnsService> {
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List of discovered") {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let (Some(instance), Some(service), Some(endpoint)) =
+            (cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        if !service.starts_with("_adb") {
+            continue;
+        }
+        // rsplit: an IPv6 literal contains colons of its own.
+        let Some((host, port)) = endpoint.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = port.parse::<u16>() else {
+            continue;
+        };
+        if host.is_empty() || port == 0 {
+            continue;
+        }
+        out.push(MdnsService {
+            instance: instance.to_string(),
+            service: service.to_string(),
+            host: host.to_string(),
+            port,
+        });
+    }
+    out
+}
+
 /// Parse `adb devices` output into a structured list.
 ///
 /// Sample input (tab-separated columns in real output):
@@ -686,6 +775,83 @@ mod tests {
         assert_eq!(entries[1].status, DeviceStatus::Unauthorized);
         assert_eq!(entries[2].connection, ConnectionType::Usb);
         assert_eq!(entries[3].status, DeviceStatus::Offline);
+    }
+
+    #[test]
+    fn parses_real_mdns_services_output() {
+        // Captured verbatim from `adb mdns services` (platform-tools 37.0.0)
+        // on a LAN with one Android 11+ TV and several legacy Shields.
+        let input = "List of discovered mdns services\n\
+            adb-58040DLCH005YV-jBeCEe\t_adb-tls-connect._tcp\t192.168.42.211:41541\n\
+            adb-1321920044953\t_adb._tcp\t192.168.42.143:5555\n\
+            adb-0323716101827\t_adb._tcp\t192.168.42.71:5555\n";
+        let services = parse_mdns_services(input);
+
+        assert_eq!(services.len(), 3);
+        assert_eq!(services[0].instance, "adb-58040DLCH005YV-jBeCEe");
+        assert_eq!(services[0].service, MDNS_SERVICE_CONNECT);
+        assert_eq!(services[0].host, "192.168.42.211");
+        // The whole point: a modern device is on a random port, not 5555.
+        assert_eq!(services[0].port, 41541);
+        assert_eq!(services[0].endpoint(), "192.168.42.211:41541");
+        assert!(services[0].is_connectable());
+        assert!(!services[0].is_pairing());
+        assert_eq!(services[1].port, 5555);
+        assert!(services[1].is_connectable());
+    }
+
+    #[test]
+    fn pairing_service_is_not_offered_as_a_connect_endpoint() {
+        // Connecting to the pairing port always fails. Keeping the two apart
+        // is the whole of the #88 fix.
+        let input = "List of discovered mdns services\n\
+            adb-58040DLCH005YV-A1b2C3\t_adb-tls-pairing._tcp\t192.168.42.211:37199\n\
+            adb-58040DLCH005YV-jBeCEe\t_adb-tls-connect._tcp\t192.168.42.211:41541\n";
+        let services = parse_mdns_services(input);
+
+        assert_eq!(services.len(), 2);
+        assert!(services[0].is_pairing());
+        assert!(!services[0].is_connectable());
+        assert!(services[1].is_connectable());
+        assert!(!services[1].is_pairing());
+        // Same TV, different ports — neither may be substituted for the other.
+        assert_eq!(services[0].host, services[1].host);
+        assert_ne!(services[0].port, services[1].port);
+    }
+
+    #[test]
+    fn unparseable_mdns_rows_are_dropped_not_guessed() {
+        let input = "List of discovered mdns services\n\
+            \n\
+            adb-missing-port\t_adb._tcp\t192.168.42.9\n\
+            adb-bad-port\t_adb._tcp\t192.168.42.9:not-a-port\n\
+            adb-zero-port\t_adb._tcp\t192.168.42.9:0\n\
+            adb-no-host\t_adb._tcp\t:5555\n\
+            adb-truncated\t_adb._tcp\n\
+            some-printer\t_ipp._tcp\t192.168.42.50:631\n\
+            adb-good\t_adb-tls-connect._tcp\t192.168.42.9:41541\n";
+        let services = parse_mdns_services(input);
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].instance, "adb-good");
+        assert_eq!(services[0].port, 41541);
+    }
+
+    #[test]
+    fn mdns_endpoint_keeps_an_ipv6_host_intact() {
+        let input = "List of discovered mdns services\n\
+            adb-v6\t_adb-tls-connect._tcp\tfe80::1c2d:3e4f:5a6b:7c8d:41541\n";
+        let services = parse_mdns_services(input);
+
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].host, "fe80::1c2d:3e4f:5a6b:7c8d");
+        assert_eq!(services[0].port, 41541);
+    }
+
+    #[test]
+    fn empty_mdns_output_is_not_an_error() {
+        assert!(parse_mdns_services("List of discovered mdns services\n").is_empty());
+        assert!(parse_mdns_services("").is_empty());
     }
 
     #[test]

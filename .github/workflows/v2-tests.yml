@@ -89,7 +89,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: v2/package-lock.json
 
@@ -105,6 +105,27 @@ jobs:
         working-directory: v2
         run: npm run build
 
+      # Guards the SmartTube backup-path catalog (#86) and the pairing flow
+      # that stopped guessing HOST:5555 (#88). Both were written as durable
+      # harnesses and then never wired into CI.
+      - name: App-files catalog
+        working-directory: v2
+        run: npm run test:app-files-catalog
+
+      - name: Install test browser
+        working-directory: v2
+        run: npx playwright install --with-deps chromium
+
+      - name: Pairing flow
+        working-directory: v2
+        run: npm run test:pairing-flow
+
+      # The Sideload tab must not read the remembered APK folder until asked
+      # (#89) — that folder is often a removable volume.
+      - name: Sideload scan
+        working-directory: v2
+        run: npm run test:sideload-scan
+
   frontend-mobile:
     name: Mobile frontend type check
     runs-on: ubuntu-latest
@@ -114,7 +135,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: v2/mobile/package-lock.json
 

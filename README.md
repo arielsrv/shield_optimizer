@@ -75,6 +75,12 @@ These builds aren't code-signed yet, so your OS may warn on first launch. One-ti
 2. Accept the debugging prompt on your TV if asked.
 3. Click your device to open it. Each tab is a feature:
 
+**Scan Network** finds devices two ways: a sweep of your subnet on the standard ADB port (5555), which is what older devices like the Shield use, and the mDNS services ADB itself has discovered. The second one matters on Android 11+, where Wireless debugging listens on a *random* port that changes every time you toggle it — a port sweep alone can never see it. If a TV is advertising only its pairing service, the scan says so and fills in its pairing address for you.
+
+For Android 11+ Wireless debugging, **Pair PIN** establishes trust using the IP:port and code in **Pair device with pairing code**. Pairing does not connect the TV. Return to the main Wireless debugging screen and enter the separate IP:port shown there in **Connect IP**; do not reuse the pairing port. If ADB connects the paired device automatically through mDNS, it will appear after the device list refreshes.
+
+There is no minimum or maximum Android version. If a device is not showing up, it is a discovery or pairing problem, not a supported-version one.
+
 | Tab | What it does |
 |-----|--------------|
 | **Overview** | Device profile — model, Android version, build. |

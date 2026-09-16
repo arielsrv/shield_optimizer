@@ -3,7 +3,7 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::adb::{parse_device_list, AdbDriver};
+use crate::adb::{batch_command, parse_device_list, split_batch, AdbDriver};
 use crate::engine::{
     detect_device_type,
     types::{Device, DeviceProperties, DeviceStatus},
@@ -105,7 +105,11 @@ pub async fn connect_device(
     state: State<'_, AppState>,
     address: String,
 ) -> Result<ConnectResult, String> {
-    let target = normalize_connect_address(&address)?;
+    connect_device_impl(state.inner(), &address).await
+}
+
+async fn connect_device_impl(state: &AppState, address: &str) -> Result<ConnectResult, String> {
+    let target = normalize_connect_address(address)?;
     let adb = state.adb_snapshot().await;
     let out = adb
         .raw(&["connect", &target])
@@ -178,11 +182,12 @@ pub struct ConnectResult {
     pub message: String,
 }
 
-/// `pair_device` — Android 11+ pairing flow. Pairs over a one-shot port the
-/// TV displays alongside a 6-digit PIN, then connects to the regular 5555
-/// port. Mirrors v1's `Connect-PinPairing` (§1.3).
+/// `pair_device` — Android 11+ pairing flow. Establishes trust over the
+/// one-shot pairing port the TV displays alongside a 6-digit PIN. Connecting
+/// is a separate step using the IP and port on the main Wireless debugging
+/// screen; modern Android devices do not necessarily listen on port 5555.
 ///
-/// `pair_address` is the IP[:port] shown on the TV's pairing screen.
+/// `pair_address` is the IP:port shown on the TV's pairing screen.
 /// `pin` is the 6-digit code, validated as digits only.
 #[tauri::command]
 pub async fn pair_device(
@@ -190,16 +195,24 @@ pub async fn pair_device(
     pair_address: String,
     pin: String,
 ) -> Result<ConnectResult, String> {
-    if let Err(message) = validate_pairing_pin(&pin) {
+    pair_device_impl(state.inner(), &pair_address, &pin).await
+}
+
+async fn pair_device_impl(
+    state: &AppState,
+    pair_address: &str,
+    pin: &str,
+) -> Result<ConnectResult, String> {
+    if let Err(message) = validate_pairing_pin(pin) {
         return Ok(ConnectResult { ok: false, message });
     }
-    let target = normalize_connect_address(&pair_address)?;
+    let target = normalize_pairing_address(pair_address)?;
     let adb = state.adb_snapshot().await;
     let pair_out = adb
-        .raw(&["pair", &target, &pin])
+        .raw(&["pair", &target, pin])
         .await
         .map_err(|e| format!("adb pair: {e}"))?;
-    let combined = format!("{}{}", pair_out.stdout, pair_out.stderr);
+    let combined = pair_out.combined().trim().to_string();
     if !combined.to_lowercase().contains("successfully paired") {
         return Ok(ConnectResult {
             ok: false,
@@ -207,20 +220,10 @@ pub async fn pair_device(
         });
     }
 
-    // After successful pair, connect on the regular 5555 port at the same IP.
-    let host_only = target.split(':').next().unwrap_or(&target);
-    let connect_target = format!("{host_only}:5555");
-    let connect_out = adb
-        .raw(&["connect", &connect_target])
-        .await
-        .map_err(|e| format!("adb connect after pair: {e}"))?;
-    let connect_result = connect_result_from(&connect_out);
     Ok(ConnectResult {
-        ok: connect_result.ok,
-        message: format!(
-            "Paired. Connect to {connect_target}: {}",
-            connect_result.message
-        ),
+        ok: true,
+        message: "Paired successfully. Pairing established trust; to connect, enter the separate IP:port shown on the TV's main Wireless debugging screen in Connect IP."
+            .to_string(),
     })
 }
 
@@ -234,29 +237,58 @@ pub fn validate_pairing_pin(pin: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate and normalize an `IP[:port]` string. Rejects empty input, IPs
-/// with the wrong shape, and any port that's not a positive 16-bit number.
-/// Returns the canonical `IP:port` string ADB expects.
+fn normalize_pairing_address(address: &str) -> Result<String, String> {
+    if !address.trim().contains(':') {
+        return Err("pairing address must include the port shown on the TV".to_string());
+    }
+    normalize_connect_address(address)
+}
+
+/// Validate and normalize an endpoint for `adb connect` / `adb pair`.
+///
+/// Accepts the three shapes a device can actually be reached at:
+/// - `IPv4[:port]` — the common case; a bare IP defaults to 5555, which is
+///   right for legacy network debugging and wrong for Android 11+. Discovery
+///   supplies the real port, so this default is a last resort for hand-typed
+///   input rather than something the app relies on.
+/// - `[IPv6]:port` — bracketed, as adb and every URL parser expect.
+/// - `adb-XXXX-YYYY._adb-tls-connect._tcp[:port]` — an mDNS service name.
+///   The daemon resolves these itself; rejecting them meant a user could not
+///   paste what discovery had just shown them (GitHub #88).
+///
+/// Rejects empty input and any port that is not a positive 16-bit number.
 pub fn normalize_connect_address(address: &str) -> Result<String, String> {
     let address = address.trim();
     if address.is_empty() {
         return Err("address is empty".to_string());
     }
 
-    let (host, port) = match address.split_once(':') {
-        Some((h, p)) => (h, p),
-        None => (address, "5555"),
+    // A bracketed IPv6 literal carries colons of its own, so the port is what
+    // follows the closing bracket, not the first colon.
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, "")) => (format!("[{inner}]"), "5555"),
+            Some((inner, tail)) => match tail.strip_prefix(':') {
+                Some(port) => (format!("[{inner}]"), port),
+                None => return Err(format!("expected [IPv6]:port, got {address}")),
+            },
+            None => return Err(format!("unterminated IPv6 address: {address}")),
+        }
+    } else {
+        match address.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p),
+            None => (address.to_string(), "5555"),
+        }
     };
 
-    let octets: Vec<&str> = host.split('.').collect();
-    if octets.len() != 4 {
-        return Err(format!("not a valid IPv4 address: {host}"));
+    if host.is_empty() {
+        return Err("address is missing a host".to_string());
     }
-    for o in &octets {
-        match o.parse::<u8>() {
-            Ok(_) => {}
-            Err(_) => return Err(format!("invalid IP octet: {o}")),
-        }
+    if !is_ipv4(&host) && !is_bracketed_ipv6(&host) && !is_mdns_instance(&host) {
+        return Err(format!(
+            "not an IP address or mDNS service name: {host}. Enter the IP and port shown on \
+             the TV's Wireless debugging screen."
+        ));
     }
 
     match port.parse::<u16>() {
@@ -266,21 +298,41 @@ pub fn normalize_connect_address(address: &str) -> Result<String, String> {
     }
 }
 
+fn is_ipv4(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok())
+}
+
+/// Only the bracketed form. Bare IPv6 is ambiguous with `host:port` and adb
+/// wants brackets anyway, so requiring them keeps the parse unambiguous.
+fn is_bracketed_ipv6(host: &str) -> bool {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|inner| !inner.is_empty() && inner.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// An adb wireless-debugging mDNS instance, e.g.
+/// `adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp`.
+fn is_mdns_instance(host: &str) -> bool {
+    host.contains("._tcp") && host.starts_with("adb-")
+}
+
 /// Batch-query device properties in a single shell call (matches v1's
 /// optimization). The exact prop set is the union of what v1 used in
 /// `Get-Devices` and `Show-DeviceProfile`.
+///
+/// Each read is its own sentinel-delimited section rather than one line of a
+/// combined stdout. Positional parsing looked equivalent but was not: the
+/// leading `settings get global device_name` can print nothing at all on some
+/// builds and a multi-line Exception on others, and either one shifts every
+/// later index — so a device would silently report its model as its Android
+/// version. Sections cannot drift, and a read that produces nothing degrades
+/// to an empty value instead of corrupting its neighbours.
 async fn harvest_properties(adb: &dyn AdbDriver, serial: &str) -> Result<DeviceProperties, String> {
-    // Use a sentinel string to delimit each prop output line — robust against
-    // empty values that would otherwise collapse adjacent lines.
-    let cmd = "settings get global device_name; getprop ro.product.brand; \
-               getprop ro.product.model; getprop ro.product.device; \
-               getprop ro.product.manufacturer; getprop ro.build.version.release; \
-               getprop ro.build.version.sdk; getprop ro.build.id; \
-               getprop ro.board.platform; getprop ro.build.characteristics; \
-               getprop ro.serialno";
+    let cmd = batch_command(&PROPERTY_READS);
 
     let out = adb
-        .shell(serial, cmd)
+        .shell(serial, &cmd)
         .await
         .map_err(|e| format!("device profile: {e}"))?;
     if out.stdout.trim().is_empty() || out.exit_code.is_some_and(|code| code != 0) {
@@ -290,9 +342,32 @@ async fn harvest_properties(adb: &dyn AdbDriver, serial: &str) -> Result<DeviceP
         ));
     }
 
-    let lines: Vec<&str> = out.stdout.lines().collect();
+    Ok(properties_from_sections(&split_batch(
+        &out.stdout,
+        PROPERTY_READS.len(),
+    )))
+}
+
+/// The property reads, in the order `properties_from_sections` consumes them.
+const PROPERTY_READS: [&str; 11] = [
+    "settings get global device_name",
+    "getprop ro.product.brand",
+    "getprop ro.product.model",
+    "getprop ro.product.device",
+    "getprop ro.product.manufacturer",
+    "getprop ro.build.version.release",
+    "getprop ro.build.version.sdk",
+    "getprop ro.build.id",
+    "getprop ro.board.platform",
+    "getprop ro.build.characteristics",
+    "getprop ro.serialno",
+];
+
+/// Pure: map batched sections onto `DeviceProperties`. Split out so the
+/// section-to-field mapping is testable without a driver.
+fn properties_from_sections(sections: &[String]) -> DeviceProperties {
     let get = |i: usize| -> String {
-        lines
+        sections
             .get(i)
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
@@ -310,7 +385,7 @@ async fn harvest_properties(adb: &dyn AdbDriver, serial: &str) -> Result<DeviceP
         Some(raw_friendly)
     };
 
-    Ok(DeviceProperties {
+    DeviceProperties {
         friendly_name,
         brand: get(1),
         model: get(2),
@@ -322,7 +397,7 @@ async fn harvest_properties(adb: &dyn AdbDriver, serial: &str) -> Result<DeviceP
         board_platform: get(8),
         characteristics: get(9),
         serial_number: get(10),
-    })
+    }
 }
 
 const MAX_DEVICE_NAME_LEN: usize = 64;
@@ -433,6 +508,112 @@ mod tests {
     use super::*;
     use crate::commands::test_support::{state_with, MockAdb};
 
+    /// Build what a device's batched property read looks like on the wire:
+    /// one section per entry in `PROPERTY_READS`, sentinel-delimited. Short
+    /// inputs pad with empty sections, mirroring a device that has a prop unset.
+    fn batched_props(values: &[&str]) -> String {
+        let mut sections: Vec<String> = values.iter().map(|v| (*v).to_string()).collect();
+        sections.resize(PROPERTY_READS.len(), String::new());
+        sections.join(&format!("\n{}\n", crate::adb::BATCH_SEPARATOR))
+    }
+
+    #[test]
+    fn every_property_read_maps_to_a_field() {
+        // The section-to-field mapping in `properties_from_sections` is
+        // positional over PROPERTY_READS; a read added without a matching
+        // `get(N)` would silently go nowhere.
+        let sections: Vec<String> = (0..PROPERTY_READS.len())
+            .map(|i| format!("value{i}"))
+            .collect();
+        let props = properties_from_sections(&sections);
+        assert_eq!(props.friendly_name.as_deref(), Some("value0"));
+        assert_eq!(props.brand, "value1");
+        assert_eq!(props.model, "value2");
+        assert_eq!(props.device_codename, "value3");
+        assert_eq!(props.manufacturer, "value4");
+        assert_eq!(props.android_release, "value5");
+        assert_eq!(props.sdk_level, "value6");
+        assert_eq!(props.build_id, "value7");
+        assert_eq!(props.board_platform, "value8");
+        assert_eq!(props.characteristics, "value9");
+        assert_eq!(props.serial_number, "value10");
+    }
+
+    #[tokio::test]
+    async fn silent_device_name_read_does_not_shift_the_android_version() {
+        // `settings get global device_name` prints nothing on some builds.
+        // Under the old positional parse every later value slid up one, so the
+        // TV reported its brand as its friendly name and its model as its
+        // Android version. Sections keep each read in its own slot.
+        let mock = MockAdb::default()
+            .on_raw(
+                "devices",
+                "List of devices attached\n192.168.42.71:5555\tdevice\n",
+            )
+            .on_shell(
+                "settings get global device_name",
+                &batched_props(&[
+                    "",
+                    "NVIDIA",
+                    "SHIELD Android TV",
+                    "mdarcy",
+                    "NVIDIA",
+                    "11",
+                    "30",
+                    "PPR1",
+                    "tegra",
+                    "tv",
+                    "0323220012345",
+                ]),
+            );
+        let state = state_with(mock);
+        let devices = list_devices_impl(&state).await.unwrap();
+        let props = devices[0].properties.as_ref().unwrap();
+
+        assert_eq!(props.friendly_name, None);
+        assert_eq!(props.brand, "NVIDIA");
+        assert_eq!(props.android_release, "11");
+        assert_eq!(props.sdk_level, "30");
+        assert_eq!(props.serial_number, "0323220012345");
+    }
+
+    #[tokio::test]
+    async fn multiline_settings_exception_stays_inside_its_own_section() {
+        // The other failure shape: `settings get` throws and prints a
+        // multi-line stack trace, which under positional parsing pushed every
+        // real property down by however many lines the trace happened to be.
+        let mock = MockAdb::default()
+            .on_raw(
+                "devices",
+                "List of devices attached\n192.168.42.71:5555\tdevice\n",
+            )
+            .on_shell(
+                "settings get global device_name",
+                &batched_props(&[
+                    "Exception occurred while executing:\n  java.lang.SecurityException\n  at android.os.Parcel",
+                    "TCL",
+                    "QM7L Pro",
+                    "",
+                    "TCL",
+                    "14",
+                    "34",
+                ]),
+            );
+        let state = state_with(mock);
+        let devices = list_devices_impl(&state).await.unwrap();
+        let props = devices[0].properties.as_ref().unwrap();
+
+        assert_eq!(props.friendly_name, None);
+        assert_eq!(props.brand, "TCL");
+        assert_eq!(props.model, "QM7L Pro");
+        assert_eq!(props.android_release, "14");
+        assert_eq!(props.sdk_level, "34");
+        // Reads the device never answered stay empty rather than borrowing a
+        // neighbour's value.
+        assert_eq!(props.build_id, "");
+        assert_eq!(props.serial_number, "");
+    }
+
     #[tokio::test]
     async fn lost_socket_during_profiling_is_not_an_authorized_device() {
         let state = state_with(
@@ -458,9 +639,12 @@ mod tests {
                  192.168.42.71:5555\tdevice\n\
                  192.168.42.143:5555\tunauthorized\n",
             )
-            // harvest_properties' batched getprop — give a brand so the name
+            // harvest_properties' batched reads — give a brand so the name
             // resolves; other props default.
-            .on_shell("settings get global device_name", "Living Room\nNVIDIA\n");
+            .on_shell(
+                "settings get global device_name",
+                &batched_props(&["Living Room", "NVIDIA"]),
+            );
         let state = state_with(mock);
         let devices = list_devices_impl(&state).await.unwrap();
         assert_eq!(devices.len(), 2);
@@ -478,6 +662,132 @@ mod tests {
     }
 
     #[test]
+    fn normalize_accepts_an_mdns_service_name_from_discovery() {
+        // Discovery shows these; refusing to accept one back meant a user
+        // could not paste what the app had just told them (GitHub #88).
+        let instance = "adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp";
+        assert_eq!(
+            normalize_connect_address(&format!("{instance}:41541")).unwrap(),
+            format!("{instance}:41541")
+        );
+        assert_eq!(
+            normalize_connect_address(instance).unwrap(),
+            format!("{instance}:5555")
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_a_bracketed_ipv6_host_whole() {
+        // The port is what follows the bracket, not the first colon.
+        assert_eq!(
+            normalize_connect_address("[fe80::1c2d:3e4f]:41541").unwrap(),
+            "[fe80::1c2d:3e4f]:41541"
+        );
+        assert_eq!(normalize_connect_address("[::1]").unwrap(), "[::1]:5555");
+    }
+
+    #[test]
+    fn normalize_still_rejects_things_that_are_not_endpoints() {
+        for bad in [
+            "not-a-host:5555",
+            "192.168.1:5555",
+            "192.168.1.300:5555",
+            "[fe80::zz]:5555",
+            "[fe80::1",
+            "[fe80::1]5555",
+            ":5555",
+            "192.168.1.5:0",
+            "192.168.1.5:port",
+        ] {
+            assert!(
+                normalize_connect_address(bad).is_err(),
+                "{bad} should not be accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_pair_establishes_trust_without_connecting_to_5555() {
+        let mock = MockAdb::default().on_raw(
+            "pair 192.168.42.71:43219 123456",
+            "Successfully paired to 192.168.42.71:43219\n",
+        );
+        let raw_log = mock.raw_log();
+        let state = state_with(mock);
+
+        let result = pair_device_impl(&state, "192.168.42.71:43219", "123456")
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(
+            result.message,
+            "Paired successfully. Pairing established trust; to connect, enter the separate IP:port shown on the TV's main Wireless debugging screen in Connect IP."
+        );
+        assert_eq!(
+            *raw_log.lock().unwrap(),
+            vec!["pair 192.168.42.71:43219 123456"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pair_remains_a_failure_and_does_not_connect() {
+        let mock = MockAdb::default().on_raw(
+            "pair 192.168.42.71:43219 123456",
+            "Failed: Wrong password\n",
+        );
+        let raw_log = mock.raw_log();
+        let state = state_with(mock);
+
+        let result = pair_device_impl(&state, "192.168.42.71:43219", "123456")
+            .await
+            .unwrap();
+
+        assert!(!result.ok);
+        assert_eq!(result.message, "Failed: Wrong password");
+        assert_eq!(
+            *raw_log.lock().unwrap(),
+            vec!["pair 192.168.42.71:43219 123456"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_pairing_pin_fails_before_adb() {
+        let mock = MockAdb::default();
+        let raw_log = mock.raw_log();
+        let state = state_with(mock);
+
+        let result = pair_device_impl(&state, "192.168.42.71:43219", "12345a")
+            .await
+            .unwrap();
+
+        assert!(!result.ok);
+        assert_eq!(result.message, "PIN must be exactly 6 digits.");
+        assert!(raw_log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_connection_port_is_used_instead_of_the_pairing_port() {
+        let mock = MockAdb::default().on_raw(
+            "connect 192.168.42.71:37123",
+            "connected to 192.168.42.71:37123\n",
+        );
+        let raw_log = mock.raw_log();
+        let state = state_with(mock);
+
+        let result = connect_device_impl(&state, "192.168.42.71:37123")
+            .await
+            .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(result.message, "connected to 192.168.42.71:37123");
+        assert_eq!(
+            *raw_log.lock().unwrap(),
+            vec!["connect 192.168.42.71:37123"]
+        );
+    }
+
+    #[test]
     fn normalize_accepts_bare_ip() {
         assert_eq!(
             normalize_connect_address("192.168.42.71").unwrap(),
@@ -490,6 +800,18 @@ mod tests {
         assert_eq!(
             normalize_connect_address("10.0.0.1:5556").unwrap(),
             "10.0.0.1:5556"
+        );
+    }
+
+    #[test]
+    fn pairing_address_requires_the_tv_supplied_port() {
+        assert_eq!(
+            normalize_pairing_address("192.168.42.71").unwrap_err(),
+            "pairing address must include the port shown on the TV"
+        );
+        assert_eq!(
+            normalize_pairing_address("192.168.42.71:43219").unwrap(),
+            "192.168.42.71:43219"
         );
     }
 

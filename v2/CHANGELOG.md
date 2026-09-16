@@ -17,6 +17,99 @@ When you add a new section, put it at the top; older releases go below.
 
 ---
 
+## v2-2.2.0-beta.1
+
+Four reported bugs reach users for the first time, plus safer defaults and a
+companion-app overhaul. Three of these fixes were written without the
+reporter's hardware in hand — if you filed one of them, please say whether this
+build works for you.
+
+### Devices and pairing
+
+- **Android 11+ devices are now discoverable.** Scan Network used to sweep your
+  subnet on port 5555 and nothing else. Modern wireless debugging listens on a
+  random port that changes every time you toggle it, so newer TVs were
+  invisible no matter what you did. The scan now also reads the mDNS services
+  ADB has discovered, which is where the real port is published (#88).
+- A TV that is advertising only its pairing service is now reported as waiting
+  to be paired, with its pairing address filled in for you, instead of being
+  counted as a failed connection.
+- Pairing asks for the separate Connect IP:port from the Wireless debugging
+  screen rather than guessing port 5555, the PIN is cleared after each attempt,
+  and a successful pairing is no longer reported as a failure when the connect
+  step fails (#88).
+- Connect IP accepts an mDNS service name and an IPv6 endpoint, so you can
+  paste back what the scan showed you.
+- For the record: there is no minimum or maximum Android version anywhere in
+  this app, and there never was.
+
+### Launchers
+
+- **Setting a default launcher now registers the new launcher before disabling
+  anything.** On Android 8 the commands this app used to discover a launcher's
+  Home activity do not exist, so nothing was ever registered — and the first
+  thing that actually happened was disabling the stock launcher, which then had
+  no one to hand Home to. That is why the switch failed and rolled back (#87).
+- A failed switch offers **Copy diagnostic details**: every command that ran and
+  what your TV replied. If a launcher switch still fails, that text is what
+  makes it fixable.
+- Each failure names the stage it failed at, and the rollback says what it
+  actually verified rather than claiming more than it knows.
+
+### macOS
+
+- **The app no longer leaves a process holding the volume it was launched
+  from.** ADB's background daemon outlives the app and inherited the app's
+  working directory, so launching from the DMG left something pinning
+  `/Volumes/...` after you closed the window — which is what kept macOS asking
+  for removable-volume access every few seconds (#89).
+- Locating the `adb` binary now resolves once instead of on every device
+  refresh, and the app explains why it is asking for removable-volume access
+  when it asks.
+- The Sideload tab remembers your APK folder and reads it only when you click
+  **Scan saved folder**.
+
+### Backups
+
+- SmartTube backup search covers `Documents/SmartTubeBackup`, where current
+  releases actually save (#86). SmartTube Beta is included too.
+- A search that could not run — because the TV stopped answering — now says so,
+  instead of reporting "No matches, export from the app first" and sending you
+  to redo an export that already worked.
+
+### Device information
+
+- Diagnostics on the companion app gained an **About this TV** card: Android
+  version and API level, manufacturer, model, codename, chipset, build ID,
+  hardware ID, and total RAM and storage. The Android version also appears
+  beside the TV name on the dashboard.
+- The desktop Profile now shows the hardware ID, so both apps report the same
+  facts.
+- Fixed a long-standing bug in the device profile read: the results were parsed
+  by position, and a TV that answered one query with nothing (or with an error)
+  shifted every later value by one — so a device could report its model as its
+  Android version. Each value is now read independently.
+
+### Safety
+
+- Apps missing from the audited catalog are labeled **Unknown** with a reason
+  instead of Safe. Unknown apps are never pre-selected for disable or uninstall;
+  you choose them explicitly and the confirmation says so.
+- A failed inventory read no longer shows an app as Enabled.
+- The last enabled launcher is protected on every disable path, not just the
+  launcher screen.
+
+### Mobile companion (beta)
+
+- Saved TVs are recognized by verified hardware identity, never by IP address
+  alone; TVs that share an address stay separate.
+- Unknown-safety labels, an unknown-app diagnostics log, a system-app filter,
+  full installed-app backup scope, and a guided Optional apps review where Keep
+  is the default.
+- Scan results are ordered deterministically and lead with TVs this phone has
+  not used. An address that answers on a different port is reported as such
+  rather than as offline.
+
 ## v2-2.1.0
 
 Launcher switching is now fast and reliable, with much clearer feedback across

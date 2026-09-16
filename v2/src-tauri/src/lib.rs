@@ -49,7 +49,7 @@ impl AdbDriver for NoAdbDriver {
 }
 
 fn default_state(app_lists: engine::AppListBundle, data_dir: PathBuf) -> AppState {
-    let adb: Arc<dyn AdbDriver> = match adb::discover_adb_binary() {
+    let adb: Arc<dyn AdbDriver> = match adb::cached_adb_binary() {
         Some(path) => {
             tracing::info!(adb = %path.display(), "adb located");
             Arc::new(SubprocessAdb::new(path))

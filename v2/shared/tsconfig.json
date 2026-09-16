@@ -1,0 +1,21 @@
+{
+  "// why": [
+    "This directory is imported by both the desktop app and the mobile app.",
+    "Without a tsconfig of its own, esbuild resolves one for these files by",
+    "walking up to v2/tsconfig.json, which extends ./.svelte-kit/tsconfig.json",
+    "— a file SvelteKit generates. The mobile build never runs svelte-kit sync,",
+    "so in a clean checkout it died with 'failed to resolve extends'. Stopping",
+    "resolution here keeps the two apps independent of each other's tooling.",
+    "Settings match the intersection of both apps' configs."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "strict": true,
+    "noEmit": true
+  },
+  "include": ["*.ts"]
+}

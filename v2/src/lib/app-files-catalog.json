@@ -1,5 +1,6 @@
 [
   {
+    "id": "projectivy",
     "package": "com.spocky.projengmenu",
     "name": "Projectivy Launcher",
     "hint": "In Projectivy: Settings → Backup & restore → Export settings — save the .plbackup file with the file picker (Downloads is typical). Then find it here and save it to this computer.",
@@ -7,12 +8,26 @@
     "pattern": "*.plbackup"
   },
   {
-    "package": "org.smarttube.stable",
+    "id": "smarttube",
+    "package": "com.teamsmart.videomanager.tv",
     "name": "SmartTube",
-    "hint": "In SmartTube: Settings → Backup/Restore → Local backup. Current releases save the ZIP in Documents/SmartTubeBackup.",
+    "hint": "In SmartTube: Settings → Backup/Restore → Local backup. Current releases save the ZIP in Documents/SmartTubeBackup; the file is named after the build (org.smarttube.stable_….zip).",
     "search_dirs": [
       "/sdcard/Documents/SmartTubeBackup",
+      "/sdcard/SmartTubeBackup",
       "/sdcard/Android/data/com.teamsmart.videomanager.tv"
+    ],
+    "pattern": "*.zip"
+  },
+  {
+    "id": "smarttube-beta",
+    "package": "com.liskovsoft.smarttubetv.beta",
+    "name": "SmartTube Beta",
+    "hint": "In SmartTube Beta: Settings → Backup/Restore → Local backup. Same export location as the stable build.",
+    "search_dirs": [
+      "/sdcard/Documents/SmartTubeBackup",
+      "/sdcard/SmartTubeBackup",
+      "/sdcard/Android/data/com.liskovsoft.smarttubetv.beta"
     ],
     "pattern": "*.zip"
   }

@@ -52,13 +52,29 @@ async function captureScreens(page, shot) {
     await page.getByText("NVIDIA SHIELD", { exact: false }).first().waitFor();
     await shot("devices");
 
-    // 2. Device → Overview (default tab).
+    // 2. Android 11+ pairing guidance, including the separate connect endpoint.
+    await page.getByRole("button", { name: "Pair PIN" }).click();
+    await page.getByText("Pairing and connecting use different ports.", { exact: false }).waitFor();
+    await page.getByText("Do not reuse the pairing port.", { exact: false }).waitFor();
+    const pairAddress = page.getByPlaceholder("IP:pair_port — e.g. 192.168.42.71:43219");
+    const pairPin = page.getByPlaceholder("6-digit PIN");
+    const connectAddress = page.getByPlaceholder("IP[:port] — e.g. 192.168.42.71");
+    await pairAddress.fill("192.168.1.42:43219");
+    await pairPin.fill("123456");
+    await page.getByRole("button", { name: "Pair", exact: true }).click();
+    await page.getByText("Paired successfully.", { exact: false }).waitFor();
+    if (await pairPin.inputValue()) throw new Error("pairing PIN was not cleared after submission");
+    if (await pairAddress.inputValue()) throw new Error("pairing address was not cleared after success");
+    if (await connectAddress.inputValue()) throw new Error("pairing guessed a connection endpoint");
+    await shot("pair-device");
+
+    // 3. Device → Overview (default tab).
     await page.goto(DEVICE_URL, { waitUntil: "networkidle" });
     await page.locator("#tab-overview").waitFor();
     await page.getByRole("heading", { name: "Profile" }).waitFor();
     await shot("overview");
 
-    // 3. Health report.
+    // 4. Health report.
     await page.locator("#tab-health").click();
     await page.getByText("3840x2160", { exact: false }).first().waitFor();
     await shot("health");
@@ -116,7 +132,7 @@ async function captureScreens(page, shot) {
     await page.getByText("Disabled packages", { exact: false }).first().waitFor();
     await shot("shell");
 
-    // 14. Global snapshots page.
+    // 15. Global snapshots page.
     await page.goto(`${BASE}/snapshots`, { waitUntil: "networkidle" });
     await page.waitForTimeout(500);
     await shot("snapshots");

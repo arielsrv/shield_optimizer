@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged into the generated Info.plist at bundle time. Tauri picks this file up
+  automatically because it sits beside tauri.conf.json.
+
+  The app touches a removable volume in exactly two places, both of which the
+  user starts: choosing a folder of APKs on the Sideload tab, and saving a file
+  pulled off the TV. macOS shows the string below when it asks, so the prompt
+  explains itself instead of arriving unattributed (GitHub #89).
+-->
+<plist version="1.0">
+  <dict>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Shield Optimizer reads a removable volume only when you pick a folder of APKs to sideload, or save a file you pulled off your TV. Declining does not affect anything else in the app.</string>
+  </dict>
+</plist>

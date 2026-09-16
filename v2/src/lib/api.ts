@@ -2,6 +2,7 @@
 // Rust backend — every command goes through here.
 
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { parseSafety } from "../../shared/safety";
 import type {
   ActionResult,
   AdbStatus,
@@ -20,6 +21,7 @@ import type {
   DisplayScaleResult,
   FileEntry,
   FileTransferResult,
+  FindResult,
   HealthReport,
   InstallApkResult,
   InstallResult,
@@ -143,7 +145,8 @@ export const api = {
     invoke<Record<string, number>>("app_memory_map", { serial }),
   appUsageMap: (serial: string) =>
     invoke<Record<string, import("$lib/types").AppUsage>>("app_usage_map", { serial }),
-  safetyInfo: (pkg: string) => invoke<Safety>("safety_info", { package: pkg }),
+  safetyInfo: async (pkg: string): Promise<Safety> =>
+    parseSafety(await invoke<unknown>("safety_info", { package: pkg })),
   trimCaches: (serial: string) => invoke<ActionResult>("trim_caches", { serial }),
   sendText: (serial: string, text: string, forceShell = false) =>
     invoke<SendTextResult>("send_text", { serial, text, forceShell }),
@@ -168,7 +171,7 @@ export const api = {
   deletePath: (serial: string, path: string, allowSystem = false) =>
     invoke<FileTransferResult>("delete_path", { serial, path, allowSystem }),
   findFiles: (serial: string, dirs: string[], pattern: string) =>
-    invoke<string[]>("find_files", { serial, dirs, pattern }),
+    invoke<FindResult>("find_files", { serial, dirs, pattern }),
   copyFileToDevice: (sourceSerial: string, remotePath: string, targetSerial: string, targetDir: string) =>
     invoke<FileTransferResult>("copy_file_to_device", { sourceSerial, remotePath, targetSerial, targetDir }),
   listApksInFolder: (folder: string) =>

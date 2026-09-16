@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
-use crate::adb::driver::discover_adb_binary;
+use crate::adb::driver::{cached_adb_binary, forget_cached_adb_binary};
 use crate::adb::{install_platform_tools, parse_device_list, AdbDriver, SubprocessAdb};
 use crate::engine::types::ConnectionType;
 
@@ -28,7 +28,7 @@ pub struct AdbStatus {
 #[tauri::command]
 pub async fn adb_status(state: State<'_, AppState>) -> Result<AdbStatus, String> {
     let adb = state.adb_snapshot().await;
-    let path = discover_adb_binary().map(|p| p.display().to_string());
+    let path = cached_adb_binary().map(|p| p.display().to_string());
     let probe = adb.raw(&["devices"]).await;
     match probe {
         Ok(out) => Ok(AdbStatus {
@@ -69,6 +69,10 @@ pub async fn restart_adb(state: State<'_, AppState>) -> Result<RestartResult, St
 /// Reusable implementation — callable from tests against an `AppState` without
 /// the `State<'_, T>` lifetime constraint.
 async fn restart_adb_impl(state: &AppState) -> Result<RestartResult, String> {
+    // The user reaching for Restart ADB is the one moment they expect a fresh
+    // look at the machine — if they just installed adb elsewhere, this is how
+    // they tell us to go find it again.
+    forget_cached_adb_binary();
     let adb = state.adb_snapshot().await;
 
     // kill-server drops every TCP connection. USB devices re-enumerate on
@@ -150,6 +154,9 @@ async fn restart_adb_impl(state: &AppState) -> Result<RestartResult, String> {
 pub async fn install_adb(state: State<'_, AppState>) -> Result<InstallResult, String> {
     match install_platform_tools().await {
         Ok(path) => {
+            // A managed install outranks everything discovery would otherwise
+            // fall back to, so the memoized answer is now stale.
+            forget_cached_adb_binary();
             let new_driver: Arc<dyn AdbDriver> = Arc::new(SubprocessAdb::new(path.clone()));
             state.replace_adb(new_driver).await;
             Ok(InstallResult {

@@ -15,7 +15,7 @@ use crate::adb::{
     parse_installed_packages_output, parse_permission_granted, parse_total_pss_by_process,
     parse_usage_stats, AppUsage,
 };
-use crate::engine::{classify_safety, is_valid_package_name, Safety};
+use crate::engine::{classify_safety, is_last_enabled_home_handler, is_valid_package_name, Safety};
 use crate::license::Feature;
 
 use super::AppState;
@@ -109,9 +109,9 @@ pub struct OtherPackage {
     /// Preinstalled (not in `pm list packages -3`).
     pub system: bool,
     pub enabled: bool,
-    /// Friendly name from the curated known-names map, when recognized. Lets the
-    /// UI show and search "Everything else" by a real name (e.g. "Artemis")
-    /// instead of only the package id. `None` for unrecognized packages.
+    /// Friendly name from the known-names map or, for an all-installed read,
+    /// the app catalog. Lets the UI search by a real name instead of only the
+    /// package id. `None` for unrecognized packages.
     pub name: Option<String>,
 }
 
@@ -147,6 +147,33 @@ pub async fn list_other_packages_impl(
     state: &AppState,
     serial: &str,
 ) -> Result<Vec<OtherPackage>, String> {
+    list_packages_impl(state, serial, false).await
+}
+
+/// `list_installed_packages` — every installed package, including entries in
+/// the curated catalog. This read-only view is used by workflows such as APK
+/// backup that need a complete picker rather than the App List's "other only"
+/// view.
+#[tauri::command]
+pub async fn list_installed_packages(
+    state: State<'_, AppState>,
+    serial: String,
+) -> Result<Vec<OtherPackage>, String> {
+    list_installed_packages_impl(state.inner(), &serial).await
+}
+
+pub async fn list_installed_packages_impl(
+    state: &AppState,
+    serial: &str,
+) -> Result<Vec<OtherPackage>, String> {
+    list_packages_impl(state, serial, true).await
+}
+
+async fn list_packages_impl(
+    state: &AppState,
+    serial: &str,
+    include_curated: bool,
+) -> Result<Vec<OtherPackage>, String> {
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -180,24 +207,28 @@ pub async fn list_other_packages_impl(
     let disabled: HashSet<String> = parse_disabled_packages_output(&sections[2])
         .into_iter()
         .collect();
-    let catalog: HashSet<&str> = state
+    let catalog_names: HashMap<&str, &str> = state
         .app_lists
         .common
         .iter()
         .chain(state.app_lists.shield.iter())
         .chain(state.app_lists.googletv.iter())
-        .map(|e| e.package.as_str())
+        .map(|e| (e.package.as_str(), e.name.as_str()))
         .collect();
 
     let mut out: Vec<OtherPackage> = all_pkgs
         .into_iter()
-        .filter(|p| !catalog.contains(p.as_str()))
+        .filter(|p| include_curated || !catalog_names.contains_key(p.as_str()))
         .map(|package| OtherPackage {
             // System if Android says so OR it's a vendor/OS package Android
             // happens to flag third-party (updated Google IMEs, etc.).
             system: !third.contains(&package) || is_first_party_package(&package),
             enabled: !disabled.contains(&package),
-            name: state.known_names.get(&package).cloned(),
+            name: state.known_names.get(&package).cloned().or_else(|| {
+                catalog_names
+                    .get(package.as_str())
+                    .map(|name| (*name).to_string())
+            }),
             package,
         })
         .collect();
@@ -276,22 +307,64 @@ pub async fn disable_package(
     serial: String,
     package: String,
 ) -> Result<ActionResult, String> {
-    if let Some(rejection) = reject_invalid_package(&package) {
+    disable_package_impl(&state, &serial, &package).await
+}
+
+/// Shared implementation so tests can drive it without Tauri's `State`.
+pub(crate) async fn disable_package_impl(
+    state: &AppState,
+    serial: &str,
+    package: &str,
+) -> Result<ActionResult, String> {
+    if let Some(rejection) = reject_invalid_package(package) {
         return Ok(rejection);
     }
-    if let Safety::NeverDisable { reason } = classify_safety(&package) {
+    if let Safety::NeverDisable { reason } = classify_safety(package) {
         return Ok(ActionResult {
             ok: false,
             message: format!("Refusing to disable {package}: {reason}"),
         });
     }
+    // The launcher screen has always refused to disable the last enabled HOME
+    // handler, but this is the path the app list and the optimize wizard use,
+    // so the same action was unguarded depending on where it was started from.
+    // A third-party launcher is Unknown to the safety rules, so nothing else
+    // stops it. Best-effort: if the handler query fails we proceed as before
+    // rather than blocking every disable on a transient read.
+    if let Some(refusal) = refuse_last_home_handler(state, serial, package).await {
+        return Ok(refusal);
+    }
     state.require_pro(Feature::CuratedDebloat)?;
     run(
-        &state,
-        &serial,
+        state,
+        serial,
         &format!("pm disable-user --user 0 {package}"),
     )
     .await
+}
+
+/// `Some(refusal)` when disabling `package` would leave the device without an
+/// enabled launcher. `None` when it is safe, or when the device could not be
+/// asked — this guards against a foot-gun, it is not the brick-prevention
+/// list, which `classify_safety` already applied above.
+async fn refuse_last_home_handler(
+    state: &AppState,
+    serial: &str,
+    package: &str,
+) -> Option<ActionResult> {
+    let adb = state.adb_snapshot().await;
+    let handlers = adb
+        .shell(serial, super::launcher::HOME_HANDLER_QUERY)
+        .await
+        .ok()
+        .map(|out| super::launcher::parse_home_handler_packages(&out.stdout))?;
+    is_last_enabled_home_handler(package, &handlers).then(|| ActionResult {
+        ok: false,
+        message: format!(
+            "Refusing to disable {package}: it's the only enabled launcher left on this \
+             device. Enable another launcher first."
+        ),
+    })
 }
 
 /// `enable_package` — `pm enable <pkg>`. Reverses a previous disable.
@@ -630,6 +703,68 @@ async fn run(state: &AppState, serial: &str, cmd: &str) -> Result<ActionResult, 
 mod tests {
     use super::*;
 
+    /// Shaped after a real Shield: Projectivy is HOME and the stock launcher
+    /// has been disabled, so the only other handler is the settings fallback.
+    fn home_handlers(pkgs: &[&str]) -> String {
+        pkgs.iter()
+            .map(|p| format!("  packageName={p}\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn disabling_the_only_launcher_is_refused_from_the_app_list() {
+        use crate::commands::test_support::{state_with, MockAdb};
+        let mock = MockAdb::default().on_shell(
+            "category.HOME",
+            &home_handlers(&["com.spocky.projengmenu", "com.android.tv.settings"]),
+        );
+        let log = mock.shell_log();
+        let state = state_with(mock);
+
+        let result = disable_package_impl(&state, "serial", "com.spocky.projengmenu")
+            .await
+            .unwrap();
+
+        assert!(!result.ok, "{}", result.message);
+        assert!(result.message.contains("only enabled launcher"));
+        let issued = log.lock().unwrap().clone();
+        assert!(
+            !issued.iter().any(|c| c.contains("pm disable-user")),
+            "the disable must not reach the device: {issued:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_launcher_is_allowed_while_another_remains() {
+        use crate::commands::test_support::{state_with, MockAdb};
+        let state = state_with(MockAdb::default().on_shell(
+            "category.HOME",
+            &home_handlers(&[
+                "com.spocky.projengmenu",
+                "com.google.android.tvlauncher",
+                "com.android.tv.settings",
+            ]),
+        ));
+
+        let result = disable_package_impl(&state, "serial", "com.spocky.projengmenu")
+            .await
+            .unwrap();
+
+        assert!(result.ok, "{}", result.message);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_handler_list_does_not_block_disabling() {
+        use crate::commands::test_support::{state_with, MockAdb};
+        let state = state_with(MockAdb::default().on_shell_err("category.HOME", "device offline"));
+
+        let result = disable_package_impl(&state, "serial", "com.example.app")
+            .await
+            .unwrap();
+
+        assert!(result.ok, "{}", result.message);
+    }
+
     #[tokio::test]
     async fn disabled_read_failure_never_becomes_enabled_state() {
         use crate::commands::test_support::{state_with, MockAdb};
@@ -644,6 +779,9 @@ mod tests {
         let three = format!("package:com.example\n{status}0\n{BATCH_SEPARATOR}\n{status}0\n{BATCH_SEPARATOR}\n{status}1\n");
         let state = state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &three));
         assert!(list_other_packages_impl(&state, "serial").await.is_err());
+        assert!(list_installed_packages_impl(&state, "serial")
+            .await
+            .is_err());
     }
     use crate::adb::BATCH_SEPARATOR;
 
@@ -740,6 +878,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_view_includes_catalog_and_other_packages_without_changing_other_view() {
+        use crate::commands::test_support::MockAdb;
+        use crate::engine::{ActionMethod, AppEntry, AppListBundle, RiskTier};
+        use std::sync::Arc;
+
+        fn entry(package: &str, name: &str) -> AppEntry {
+            AppEntry {
+                package: package.to_string(),
+                name: name.to_string(),
+                method: ActionMethod::Disable,
+                risk: RiskTier::Safe,
+                optimize_description: String::new(),
+                restore_description: String::new(),
+                default_optimize: false,
+                default_restore: false,
+                play_store: false,
+                defunct: false,
+                review: false,
+            }
+        }
+
+        let listing =
+            "package:com.catalog.video\npackage:com.example.sideload\npackage:com.android.settings";
+        let third_party = "package:com.catalog.video\npackage:com.example.sideload";
+        let disabled = "package:com.android.settings";
+        let output = batched(&[listing, third_party, disabled]);
+        let bundle = AppListBundle {
+            common: vec![entry("com.catalog.video", "Catalog Video")],
+            shield: vec![],
+            googletv: vec![],
+        };
+        let make_state = || {
+            AppState::new(
+                Arc::new(MockAdb::default().on_shell(BATCH_SEPARATOR, &output)),
+                bundle.clone(),
+                std::env::temp_dir(),
+            )
+            .with_known_names(HashMap::from([(
+                "com.example.sideload".to_string(),
+                "Sideload Player".to_string(),
+            )]))
+        };
+
+        let installed = list_installed_packages_impl(&make_state(), "serial")
+            .await
+            .expect("all installed packages");
+        assert_eq!(installed.len(), 3);
+        let catalog = installed
+            .iter()
+            .find(|row| row.package == "com.catalog.video")
+            .expect("curated package included");
+        assert_eq!(catalog.name.as_deref(), Some("Catalog Video"));
+        assert!(!catalog.system);
+        assert!(catalog.enabled);
+        let sideload = installed
+            .iter()
+            .find(|row| row.package == "com.example.sideload")
+            .expect("noncatalog package included");
+        assert_eq!(sideload.name.as_deref(), Some("Sideload Player"));
+        assert!(!sideload.system);
+        assert!(sideload.enabled);
+        let protected = installed
+            .iter()
+            .find(|row| row.package == "com.android.settings")
+            .expect("protected system package remains visible to read-only backup picker");
+        assert!(matches!(
+            classify_safety(&protected.package),
+            Safety::NeverDisable { .. }
+        ));
+        assert!(protected.system);
+        assert!(!protected.enabled);
+
+        let others = list_other_packages_impl(&make_state(), "serial")
+            .await
+            .expect("other-only packages");
+        assert_eq!(others.len(), 2);
+        assert!(
+            others.iter().all(|row| row.package != "com.catalog.video"),
+            "the existing command must continue excluding curated packages"
+        );
+    }
+
+    #[tokio::test]
     async fn list_other_packages_errors_when_the_primary_listing_is_empty() {
         use crate::commands::test_support::{state_with, MockAdb};
 
@@ -754,6 +975,22 @@ mod tests {
                 rows.len()
             ),
             Err(e) => e,
+        };
+        assert!(err.contains("pm list packages"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_installed_packages_errors_when_the_primary_listing_is_empty() {
+        use crate::commands::test_support::{state_with, MockAdb};
+
+        let state =
+            state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &batched(&["", "", ""])));
+        let err = match list_installed_packages_impl(&state, "serial").await {
+            Ok(rows) => panic!(
+                "empty package listing must be an error, got {} rows",
+                rows.len()
+            ),
+            Err(err) => err,
         };
         assert!(err.contains("pm list packages"), "unhelpful error: {err}");
     }

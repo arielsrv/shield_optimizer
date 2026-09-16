@@ -223,6 +223,10 @@ export interface SetLauncherResult {
   /// Polite strategies failed, but disabling the active stock launcher would
   /// work — the UI confirms with the user and retries with allowStockDisable.
   stock_takeover_available: boolean;
+  /// Every command the attempt issued and what the device replied, in order.
+  /// Offered as copyable detail on failure — launcher behavior varies enough
+  /// between builds that a report is only actionable with the per-stage record.
+  diagnostics: string[];
 }
 
 export interface InstallApkResult {
@@ -259,7 +263,17 @@ export interface ScanResult {
   connected: string[];
   unauthorized: string[];
   failed: string[];
+  /// Pairing `host:port` for devices advertising only an Android 11+ pairing
+  /// service. They need the 6-digit code from the TV before they can connect.
+  needs_pairing: string[];
   message: string;
+}
+
+export interface FindResult {
+  hits: string[];
+  /// Directories whose search could not be run because the ADB call failed —
+  /// distinct from a directory that simply holds no matches.
+  unsearched: string[];
 }
 
 export interface ScreenshotResult {
@@ -339,10 +353,7 @@ export interface ApplyResult {
   summary: string;
 }
 
-export type Safety =
-  | { kind: "never_disable"; reason: string }
-  | { kind: "caution"; reason: string }
-  | { kind: "safe" };
+export type { Safety } from "../../shared/safety";
 
 export interface RecoveryFailure {
   package: string;
