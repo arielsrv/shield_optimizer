@@ -57,4 +57,3 @@ export const surroundLabel: Record<SurroundMode, string> = {
   unset: "Default/unset",
   unknown: "Unknown setting",
 };
-
