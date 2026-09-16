@@ -4388,6 +4388,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "pretty_assertions",
+ "quick-xml",
  "regex",
  "serde",
  "serde_json",

@@ -77,6 +77,7 @@
     const total =
       plan.packages_to_disable.length +
       Object.keys(plan.settings_to_write).length +
+      plan.settings_to_delete.length +
       (plan.launcher_to_set ? 1 : 0);
     if (!confirm(`Apply ${snap.filename} to ${previewState.deviceName}?\n\n${total} change(s). Disabled packages can be re-enabled via Emergency Recovery.`)) return;
     applyBusy = true;
@@ -167,6 +168,7 @@
       {plan.packages_already_disabled.length} already disabled ·
       {plan.packages_not_installed.length} not on device ·
       <strong>{settingKeys.length}</strong> setting{settingKeys.length === 1 ? "" : "s"}
+      to write · <strong>{plan.settings_to_delete.length}</strong> to reset
       {#if plan.launcher_to_set}· launcher{/if}
     </div>
 
@@ -181,6 +183,9 @@
         {/if}
         {#each settingKeys as k (k)}
           <tr class="acting"><td class="mono small">{k}</td><td><span class="plan-act setting">Set → {plan.settings_to_write[k]}</span></td></tr>
+        {/each}
+        {#each plan.settings_to_delete as k (k)}
+          <tr class="acting"><td class="mono small">{k}</td><td><span class="plan-act setting">Reset → device default (delete override)</span></td></tr>
         {/each}
         {#each plan.packages_already_disabled as pkg (pkg)}
           <tr class="dim"><td class="mono small">{pkg}</td><td><span class="terminal-reason">Already disabled</span></td></tr>

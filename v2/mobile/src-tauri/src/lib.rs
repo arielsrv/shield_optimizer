@@ -214,6 +214,8 @@ pub fn run() {
             devices::device_profile,
             devices::rename_device,
             health::health_report,
+            health::media_report,
+            health::resource_sample,
             health::app_list_for_device,
             health::report_all,
             launcher::list_launchers,

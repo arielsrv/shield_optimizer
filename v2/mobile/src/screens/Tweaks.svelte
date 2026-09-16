@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { api } from "../lib/api";
   import { session } from "../lib/session.svelte";
   import type { Screen } from "../lib/router.svelte";
@@ -35,6 +35,7 @@
   let dnsEditing = $state(false);
   let scaleConfirm = $state<DisplayScalePreset | null>(null);
   let loadGeneration = 0;
+  let destroyed = false;
 
   let toast = $state("");
   let toastType = $state<"success" | "error" | "info">("info");
@@ -52,9 +53,10 @@
 
   async function load() {
     const serial = session.serial;
+    const connection = session.generation;
     const generation = ++loadGeneration;
-    if (!serial) {
-      noDevice = "No TV connected.";
+    if (!serial || !session.isConnected) {
+      noDevice = "No live TV connection.";
       loading = false;
       return;
     }
@@ -65,7 +67,10 @@
       api.getPrivateDns(serial),
       api.getDisplayScaling(serial),
     ]);
-    if (generation !== loadGeneration || serial !== session.serial) return;
+    if (
+      destroyed || generation !== loadGeneration || serial !== session.serial ||
+      connection !== session.generation || !session.isConnected
+    ) return;
     if (t.status === "fulfilled") {
       tweaks = t.value;
       tweaksError = "";
@@ -88,7 +93,28 @@
     loading = false;
   }
 
-  onMount(load);
+  $effect(() => {
+    void session.serial;
+    void session.generation;
+    void session.liveness;
+    tweaks = null;
+    dns = null;
+    scaling = null;
+    tweaksError = "";
+    dnsError = "";
+    scalingError = "";
+    busy = "";
+    toast = "";
+    showPaywall = false;
+    clearTimeout(toastTimer);
+    untrack(() => void load());
+  });
+
+  onDestroy(() => {
+    destroyed = true;
+    ++loadGeneration;
+    clearTimeout(toastTimer);
+  });
 
   // Wrap a Pro write: route LOCKED to the paywall, reload on success/revert,
   // never fabricate the new value (we re-read the device instead).
@@ -99,10 +125,16 @@
   ) {
     if (busy) return;
     const targetSerial = session.serial;
-    if (!targetSerial) return;
+    if (!targetSerial || !session.isConnected) return;
+    const connection = session.generation;
+    const current = () =>
+      !destroyed && targetSerial === session.serial &&
+      connection === session.generation && session.isConnected;
     busy = key;
     try {
       const r = await fn(targetSerial);
+      if (!current()) return;
+      session.invalidateHealth();
       if (r.ok) {
         showToast(successMsg, "success");
         await load();
@@ -113,13 +145,15 @@
         await load();
       }
     } catch (e) {
+      if (!current()) return;
       if (isLocked(e)) showPaywall = true;
       else {
+        session.invalidateHealth();
         showToast(String(e), "error");
         await load();
       }
     } finally {
-      busy = "";
+      if (current()) busy = "";
     }
   }
 
@@ -175,6 +209,49 @@
   ]);
 
   const frameRate = $derived(tweaks?.match_content_frame_rate ?? null);
+  const surroundMode = $derived(tweaks?.encoded_surround_output ?? null);
+  const audioFormats = $derived(
+    (tweaks?.encoded_surround_output_enabled_formats ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  const surroundModes = [
+    { value: "0", label: "Auto" },
+    { value: "1", label: "Never" },
+    { value: "2", label: "Always" },
+    { value: "3", label: "Manual" },
+  ];
+  const audioChoices = [
+    { value: "5", label: "Dolby Digital (AC-3)" },
+    { value: "6", label: "Dolby Digital Plus (E-AC-3)" },
+    { value: "18", label: "E-AC-3 JOC (Atmos)" },
+    { value: "14", label: "Dolby TrueHD" },
+    { value: "7", label: "DTS" },
+    { value: "8", label: "DTS-HD" },
+  ];
+  function audioLabel(value: string): string {
+    return audioChoices.find((choice) => choice.value === value)?.label
+      ?? ({ "26": "MPEG-H LC L4", "27": "DTS UHD P1" }[value])
+      ?? `Encoding ${value}`;
+  }
+  function setSurroundMode(value: string) {
+    apply(
+      "audio-mode",
+      (target) => api.writeSetting(target, "global", "encoded_surround_output", value),
+      "Surround policy updated.",
+    );
+  }
+  function toggleAudioFormat(value: string) {
+    const next = audioFormats.includes(value)
+      ? audioFormats.filter((format) => format !== value)
+      : [...audioFormats, value];
+    apply(
+      "audio-formats",
+      (target) => api.writeSetting(target, "global", "encoded_surround_output_enabled_formats", next.join(",")),
+      "Manual audio formats updated.",
+    );
+  }
   const animScale = $derived(
     tweaks?.window_animation_scale != null ? parseFloat(tweaks.window_animation_scale) : null,
   );
@@ -475,6 +552,33 @@
                 >
               {/each}
             </div>
+          </div>
+        {/if}
+
+        {#if !tweaksError}
+          <div class="tweak-row column">
+            <div class="t-row-head">
+              <div class="t-info">
+                <span class="t-title">Surround audio</span>
+                <span class="t-desc">Current policy: {surroundModes.find((mode) => mode.value === surroundMode)?.label ?? (surroundMode == null ? "Default / unset" : `Unknown (${surroundMode})`)}. Receiver and app support determine actual playback.</span>
+              </div>
+              <button class="reset-btn" disabled={busy !== ""} onclick={() => setSurroundMode("")}>Reset audio policy</button>
+            </div>
+            <div class="segmented">
+              {#each surroundModes as mode (mode.value)}
+                <button class="seg" class:active={surroundMode === mode.value} disabled={busy !== ""} onclick={() => setSurroundMode(mode.value)} aria-label={`Surround ${mode.label}`}>{mode.label}</button>
+              {/each}
+            </div>
+            {#if surroundMode === "3"}
+              <p class="t-desc">Enable only formats supported by your receiver. Existing encodings not listed below are preserved.</p>
+              {#each audioChoices as format (format.value)}
+                <label class="subrow">
+                  <span class="t-subtitle">{format.label}</span>
+                  <input type="checkbox" checked={audioFormats.includes(format.value)} disabled={busy !== ""} onchange={() => toggleAudioFormat(format.value)} />
+                </label>
+              {/each}
+              <span class="t-desc">Configured: {audioFormats.length ? audioFormats.map(audioLabel).join(", ") : "None / unset"}</span>
+            {/if}
           </div>
         {/if}
 

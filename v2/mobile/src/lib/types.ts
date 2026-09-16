@@ -236,7 +236,6 @@ export interface TweaksState {
   animator_duration_scale: string | null;
   background_process_limit: string | null;
   /// Encoded audio passthrough: "0" Auto, "1" Never, "2" Always, "3" Manual.
-  /// Read by `get_tweaks`; no mobile control exposes it yet.
   encoded_surround_output: string | null;
   /// Comma-separated AudioFormat encodings; applies only in Manual mode.
   encoded_surround_output_enabled_formats: string | null;
@@ -245,6 +244,16 @@ export interface TweaksState {
 export interface WriteResult {
   ok: boolean;
   message: string;
+}
+
+export interface ResourceSample {
+  cpu_percent: number | null;
+  interfaces: Array<{
+    name: string;
+    rx_bytes_per_s: number | null;
+    tx_bytes_per_s: number | null;
+  }>;
+  interval_ms: number | null;
 }
 
 /// Must stay in lockstep with the Rust `DisplayScalePreset` serde renames.
@@ -295,6 +304,7 @@ export interface SnapshotApplyPlan {
   packages_not_installed: string[];
   launcher_to_set: string | null;
   settings_to_write: Record<string, string>;
+  settings_to_delete: string[];
   settings_already_set: string[];
 }
 
@@ -304,6 +314,7 @@ export interface ApplyResult {
   launcher_set: boolean;
   launcher_message: string | null;
   settings_written: string[];
+  settings_deleted: string[];
   settings_failed: string[];
   summary: string;
 }

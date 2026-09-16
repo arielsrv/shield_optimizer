@@ -180,6 +180,19 @@ pub mod test_support {
 
     #[async_trait]
     impl AdbDriver for MockAdb {
+        async fn shell_bounded(
+            &self,
+            serial: &str,
+            command: &str,
+        ) -> AdbResult<crate::adb::driver::BoundedShellOutput> {
+            let output = self.shell(serial, command).await?;
+            Ok(crate::adb::driver::BoundedShellOutput {
+                stdout: output.stdout,
+                stderr: output.stderr,
+                exit_code: output.exit_code,
+                termination: crate::adb::driver::ShellTermination::Completed,
+            })
+        }
         async fn raw(&self, args: &[&str]) -> AdbResult<AdbOutput> {
             let command = args.join(" ");
             self.raw_log.lock().unwrap().push(command.clone());

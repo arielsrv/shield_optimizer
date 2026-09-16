@@ -126,6 +126,10 @@ jobs:
         working-directory: v2
         run: npm run test:sideload-scan
 
+      - name: Playback and expert shell regressions
+        working-directory: v2
+        run: npm run test:playback-shell
+
   frontend-mobile:
     name: Mobile frontend type check
     runs-on: ubuntu-latest

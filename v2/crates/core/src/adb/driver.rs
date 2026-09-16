@@ -49,6 +49,22 @@ pub struct AdbOutput {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellTermination {
+    Completed,
+    OutputLimit,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedShellOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub termination: ShellTermination,
+}
+
 impl AdbOutput {
     /// Returns `true` if exit code was 0.
     pub fn success(&self) -> bool {
@@ -103,6 +119,13 @@ pub trait AdbDriver: Send + Sync {
     /// Run `adb -s <serial> shell <command>`.
     async fn shell(&self, serial: &str, command: &str) -> AdbResult<AdbOutput>;
 
+    /// Expert shell execution must bound output and runtime at the transport.
+    async fn shell_bounded(&self, _serial: &str, _command: &str) -> AdbResult<BoundedShellOutput> {
+        Err(AdbError::Unsupported {
+            operation: "shell_bounded",
+        })
+    }
+
     /// Run `adb <args...>` and return raw stdout bytes — for binary output
     /// like `exec-out screencap -p`, where UTF-8 conversion would corrupt the
     /// data. Default reports unsupported so mocks without binary needs don't
@@ -133,5 +156,33 @@ pub trait AdbDriver: Send + Sync {
     /// unsupported so mocks need no extra wiring.
     async fn spawn(&self, _args: &[&str]) -> AdbResult<tokio::process::Child> {
         Err(AdbError::Unsupported { operation: "spawn" })
+    }
+}
+
+#[cfg(test)]
+mod bounded_shell_tests {
+    use super::*;
+
+    struct UnboundedDriver;
+
+    #[async_trait]
+    impl AdbDriver for UnboundedDriver {
+        async fn raw(&self, _: &[&str]) -> AdbResult<AdbOutput> {
+            panic!("bounded shell must not delegate to raw")
+        }
+
+        async fn shell(&self, _: &str, _: &str) -> AdbResult<AdbOutput> {
+            panic!("bounded shell must not delegate to shell")
+        }
+    }
+
+    #[tokio::test]
+    async fn drivers_without_bounded_execution_are_unsupported() {
+        assert!(matches!(
+            UnboundedDriver.shell_bounded("serial", "id").await,
+            Err(AdbError::Unsupported {
+                operation: "shell_bounded"
+            })
+        ));
     }
 }

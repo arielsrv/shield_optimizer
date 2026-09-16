@@ -25,7 +25,9 @@ This directory is the v2 workspace. v1 (`Shield-Optimizer.ps1` at the repo root)
 - Lists ADB devices with friendly model names + device-type detection
 - Full device management: profile, health report, launcher wizard (install/set-default/disable stock), optimize wizard with per-app defaults, full app list with disable/enable/force-stop/uninstall, Tweaks (HDMI-CEC, animations, display scaling), APK sideload, APK backup and cross-device clone, file manager, device screenshots, reboot + recovery, and snapshot save/preview/apply
 
-**Remaining feature gaps vs. aTV Tools:** see [`ATVTOOLS-PARITY.md`](ATVTOOLS-PARITY.md). Headline items not yet shipped: screen recording, shell runner, permissions viewer, CPU + network monitor.
+**Remaining feature gaps vs. aTV Tools:** see [`ATVTOOLS-PARITY.md`](ATVTOOLS-PARITY.md). Screen recording and a permissions viewer remain unimplemented. The unreleased desktop adds playback configuration reports, CPU/per-interface network samples, and an opt-in expert shell. Playback and resource reports plus audio policy controls are also available in the mobile companion; mobile does not expose arbitrary shell.
+
+Expert shell can erase data or make a device unusable. Its obvious-command checks are not a security boundary. Execution stops the local ADB client after 30 seconds or 256 KiB from either output stream, which does not guarantee remote work has stopped. Saved bookmarks stay in local app preferences; commands and output are not added to diagnostics logs.
 
 The behavior spec is at [`docs/FEATURES.md`](../docs/FEATURES.md). The ATV Optimizer Android app plan is in [`ATV-OPTIMIZER-ANDROID-PLAN.md`](ATV-OPTIMIZER-ANDROID-PLAN.md).
 

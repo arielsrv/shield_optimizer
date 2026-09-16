@@ -4,7 +4,8 @@
   import { session } from "../lib/session.svelte";
   import type { Screen } from "../lib/router.svelte";
   import { tierOf } from "../lib/safety";
-  import type { Safety } from "../lib/types";
+  import type { ResourceSample, Safety } from "../lib/types";
+  import { formatSupport, matchContentLabel, type MediaCapabilities } from "../../../shared/media";
   import FindRemoteButton from "../components/FindRemoteButton.svelte";
 
   let { navigate, back }: {
@@ -26,6 +27,68 @@
   let catalogNames = $state<Record<string, string>>({});
   let catalogRequest = 0;
   let destroyed = false;
+  let playback = $state<MediaCapabilities | null>(null);
+  let playbackError = $state("");
+  let playbackBusy = $state(false);
+  let playbackRequest = 0;
+  let resources = $state<ResourceSample | null>(null);
+  let resourceError = $state("");
+  let resourceBusy = $state(false);
+  let resourceRequest = 0;
+
+  $effect(() => {
+    void session.serial;
+    void session.generation;
+    void session.liveness;
+    ++playbackRequest;
+    ++resourceRequest;
+    playback = null;
+    resources = null;
+    playbackError = "";
+    resourceError = "";
+    playbackBusy = false;
+    resourceBusy = false;
+  });
+
+  async function readPlayback() {
+    if (playbackBusy || resourceBusy || !session.isConnected) return;
+    const serial = session.serial;
+    const generation = session.generation;
+    const request = ++playbackRequest;
+    const current = () => !destroyed && request === playbackRequest && serial === session.serial && generation === session.generation && session.isConnected;
+    playbackBusy = true;
+    playbackError = "";
+    playback = null;
+    try {
+      const report = await api.mediaReport(serial);
+      if (current()) playback = report;
+    } catch (error) {
+      if (current()) playbackError = String(error);
+    } finally {
+      if (current()) playbackBusy = false;
+    }
+  }
+
+  async function sampleResources() {
+    if (resourceBusy || playbackBusy || !session.isConnected) return;
+    const serial = session.serial;
+    const generation = session.generation;
+    const request = ++resourceRequest;
+    const current = () => !destroyed && request === resourceRequest && serial === session.serial && generation === session.generation && session.isConnected;
+    resourceBusy = true;
+    resourceError = "";
+    resources = null;
+    try {
+      const sample = await api.resourceSample(serial);
+      if (current()) resources = sample;
+    } catch (error) {
+      if (current()) resourceError = String(error);
+    } finally {
+      if (current()) resourceBusy = false;
+    }
+  }
+
+  const rate = (value: number | null) => value == null ? "Unavailable" : `${(value / 1024).toFixed(1)} KiB/s`;
 
   let liveMode = $state(false);
   let liveTimer: ReturnType<typeof setInterval> | undefined;
@@ -132,6 +195,8 @@
     destroyed = true;
     ++safetyRequest;
     ++catalogRequest;
+    ++playbackRequest;
+    ++resourceRequest;
     stopLive();
   });
 
@@ -400,9 +465,57 @@
     </div>
   {/if}
 
+  {#if session.connectedDevice}
+    <div class="diagnostics-content reports">
+      <section class="diagnostic-card" aria-label="Playback report">
+        <div class="card-header">
+          <span class="card-title">Playback report</span>
+          <button class="retry-link" disabled={playbackBusy || resourceBusy || !session.isConnected} onclick={readPlayback}>{playbackBusy ? "Reading…" : "Read playback report"}</button>
+        </div>
+        <p class="temp-note">Advertised configuration, not a playback test. Actual decoding and passthrough depend on the app, content and connected display or receiver.</p>
+        {#if playbackError}<p class="error" role="alert">{playbackError}</p>{/if}
+        {#if playback}
+          <dl class="about-list">
+            {#each playback.video as format (format.mime)}
+              <dt>{format.label}</dt><dd>{formatSupport(format).label}</dd>
+            {/each}
+            <dt>Advertised HDR</dt><dd>{playback.hdr_types.length ? playback.hdr_types.join(", ") : "Unknown / not reported"}</dd>
+            <dt>Display modes</dt><dd>{playback.modes.length ? playback.modes.map((mode) => `${mode.width}×${mode.height} @ ${mode.fps} Hz${mode.active ? " (active)" : ""}`).join(", ") : "Unknown / not reported"}</dd>
+            <dt>Surround policy</dt><dd>{playback.audio.mode === "unset" ? "Default / unset" : playback.audio.mode}</dd>
+            <dt>Manual formats</dt><dd>{playback.audio.enabled_formats.join(", ") || "None / unset"}</dd>
+            <dt>Frame-rate policy</dt><dd>{playback.match_content_frame_rate == null ? "Default / unset" : (matchContentLabel[playback.match_content_frame_rate] ?? `Unknown (${playback.match_content_frame_rate})`)}</dd>
+          </dl>
+          {#each playback.verdicts as verdict}
+            <p class="temp-note"><strong>{verdict.title}</strong> {verdict.detail}</p>
+          {/each}
+        {/if}
+      </section>
+      <section class="diagnostic-card" aria-label="Resource sample">
+        <div class="card-header">
+          <span class="card-title">CPU &amp; network</span>
+          <button class="retry-link" disabled={resourceBusy || playbackBusy || !session.isConnected} onclick={sampleResources}>{resourceBusy ? "Sampling…" : "Sample resources"}</button>
+        </div>
+        <p class="temp-note">One device-side sample per tap. Interfaces are shown separately because VPN traffic can also appear on the physical interface.</p>
+        {#if resourceError}<p class="error" role="alert">{resourceError}</p>{/if}
+        {#if resources}
+          <dl class="about-list">
+            <dt>CPU use</dt><dd>{resources.cpu_percent == null ? "Unavailable" : `${resources.cpu_percent.toFixed(1)}%`}</dd>
+            <dt>Sample duration</dt><dd>{resources.interval_ms == null ? "Unavailable" : `${(resources.interval_ms / 1000).toFixed(2)} s`}</dd>
+            {#each resources.interfaces as network (network.name)}
+              <dt>{network.name}</dt><dd>Receive {rate(network.rx_bytes_per_s)} · Send {rate(network.tx_bytes_per_s)}</dd>
+            {/each}
+          </dl>
+          {#if resources.interfaces.length === 0}<p class="temp-note">No network counters available.</p>{/if}
+        {/if}
+      </section>
+    </div>
+  {/if}
 </div>
 
 <style>
+  .reports {
+    margin-top: 16px;
+  }
   .header-left {
     display: flex;
     gap: 8px;

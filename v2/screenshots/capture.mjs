@@ -81,7 +81,7 @@ async function captureScreens(page, shot) {
 
     // 4. Playback capabilities.
     await page.locator("#tab-media").click();
-    await page.getByText("Video decoding", { exact: false }).first().waitFor();
+    await page.getByRole("heading", { name: "Video codec configuration" }).waitFor();
     await shot("playback");
 
     // 5. Launcher.

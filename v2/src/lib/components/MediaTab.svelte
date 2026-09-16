@@ -1,49 +1,47 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { api } from "$lib/api";
-  import type { DeviceType, MediaCapabilities, VideoFormat } from "$lib/types";
+  import type { MediaCapabilities } from "$lib/types";
+  import { formatSupport, matchContentLabel, surroundLabel } from "../../../shared/media";
 
-  let { serial, deviceType }: { serial: string; deviceType: DeviceType } = $props();
+  let { serial, active = true, resetToken = 0 }: {
+    serial: string; active?: boolean; resetToken?: number;
+  } = $props();
 
   let caps = $state<MediaCapabilities | null>(null);
   let loading = $state(false);
   let err = $state<string | null>(null);
+  let request = 0;
+  let destroyed = false;
 
   async function load() {
+    const id = ++request;
+    const target = serial;
+    const token = resetToken;
+    const current = () => !destroyed && id === request && serial === target && resetToken === token;
     loading = true;
     err = null;
     try {
-      caps = await api.mediaReport(serial, deviceType);
+      const result = await api.mediaReport(target);
+      if (current()) caps = result;
     } catch (e) {
-      err = String(e);
+      if (current()) err = String(e);
     } finally {
-      loading = false;
+      if (current()) loading = false;
     }
   }
 
-  onMount(load);
-
-  /// Three states, not two: "not advertised" is genuinely different from
-  /// "software only", and collapsing them would hide the AV1 answer.
-  function formatSupport(v: VideoFormat): { label: string; cls: string } {
-    if (v.hardware) return { label: "Hardware", cls: "ok" };
-    if (v.software) return { label: "Software only", cls: "warn" };
-    return { label: "Not supported", cls: "bad" };
-  }
-
-  const matchContentLabel: Record<string, string> = {
-    "0": "Never",
-    "1": "Seamless only",
-    "2": "Always",
-  };
-
-  const surroundLabel: Record<string, string> = {
-    auto: "Auto",
-    never: "Never",
-    always: "Always",
-    manual: "Manual",
-    unset: "Auto (unset)",
-  };
+  $effect(() => {
+    serial;
+    resetToken;
+    untrack(() => { ++request; caps = null; err = null; loading = false; });
+  });
+  $effect(() => {
+    serial;
+    resetToken;
+    if (active) untrack(() => { void load(); });
+  });
+  onDestroy(() => { destroyed = true; ++request; });
 
   // A mode is only worth calling out when it can carry 24p film — the whole
   // reason the full mode list is fetched instead of just the active one.
@@ -58,8 +56,8 @@
     </button>
   </div>
   <p class="muted small">
-    What this device can actually decode and output, read from the device itself —
-    its codec list, display modes, and audio passthrough settings.
+    Device-reported codec configuration, display modes, and audio settings.
+    This is not a runtime playback or hardware-acceleration test.
   </p>
 
   {#if err}
@@ -74,21 +72,15 @@
           <li class="verdict {v.level}">
             <div class="verdict-title">{v.title}</div>
             <div class="verdict-detail">{v.detail}</div>
-            {#if v.note}
-              <div class="verdict-note">
-                <span class="note-tag">This device</span>
-                {v.note}
-              </div>
-            {/if}
           </li>
         {/each}
       </ul>
     {/if}
 
-    <h3>Video decoding</h3>
+    <h3>Video codec configuration</h3>
     <table class="media-table">
       <thead>
-        <tr><th>Format</th><th>Decoding</th><th class="mime">MIME</th></tr>
+        <tr><th>Format</th><th>Reported configuration</th><th class="mime">MIME</th></tr>
       </thead>
       <tbody>
         {#each caps.video as v (v.mime)}
@@ -104,14 +96,14 @@
 
     <h3>HDR formats</h3>
     <p class="muted small">
-      What the current display chain accepts — this tracks the TV or receiver
-      that is connected right now, not a fixed property of the device.
+      HDR formats reported for the current display chain, not a fixed property
+      of the device. Missing information does not establish SDR-only output.
     </p>
     <p class="hdr-list">
       {#if caps.hdr_types.length}
         {#each caps.hdr_types as h (h)}<span class="pill ok">{h}</span>{/each}
       {:else}
-        <span class="pill bad">SDR only</span>
+        <span class="pill">No HDR information reported</span>
       {/if}
     </p>
 
@@ -121,7 +113,7 @@
       <strong>
         {caps.match_content_frame_rate
           ? (matchContentLabel[caps.match_content_frame_rate] ?? caps.match_content_frame_rate)
-          : "Never (unset)"}
+          : "Default/unset"}
       </strong>
       — change it on the Tweaks tab.
     </p>
@@ -236,28 +228,6 @@
     font-size: 0.85rem;
     color: var(--fg-secondary);
     line-height: 1.45;
-  }
-  /* Curated knowledge is set apart from the derived detail on purpose — the
-     user should be able to tell what the device said from what we know. */
-  .verdict-note {
-    margin-top: 0.45rem;
-    padding-top: 0.45rem;
-    border-top: 1px dashed var(--border);
-    font-size: 0.85rem;
-    color: var(--fg-secondary);
-    line-height: 1.45;
-  }
-  .note-tag {
-    display: inline-block;
-    margin-right: 0.35rem;
-    padding: 0.05rem 0.35rem;
-    border-radius: 3px;
-    background: var(--bg-button);
-    border: 1px solid var(--border);
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    color: var(--fg-secondary);
   }
   .media-table {
     width: 100%;

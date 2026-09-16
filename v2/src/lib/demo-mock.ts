@@ -82,12 +82,12 @@ const health: HealthReport = {
 
 const media: MediaCapabilities = {
   video: [
-    { label: "H.264 / AVC", mime: "video/avc", hardware: true, software: true },
-    { label: "HEVC / H.265", mime: "video/hevc", hardware: true, software: true },
-    { label: "VP9", mime: "video/x-vnd.on2.vp9", hardware: true, software: true },
-    { label: "AV1", mime: "video/av01", hardware: false, software: true },
-    { label: "Dolby Vision", mime: "video/dolby-vision", hardware: true, software: false },
-    { label: "MPEG-2", mime: "video/mpeg2", hardware: true, software: false },
+    { label: "H.264 / AVC", mime: "video/avc", advertised: true, acceleration_unknown: true, software: true },
+    { label: "HEVC / H.265", mime: "video/hevc", advertised: true, acceleration_unknown: true, software: true },
+    { label: "VP9", mime: "video/x-vnd.on2.vp9", advertised: true, acceleration_unknown: true, software: true },
+    { label: "AV1", mime: "video/av01", advertised: true, acceleration_unknown: false, software: true },
+    { label: "Dolby Vision", mime: "video/dolby-vision", advertised: true, acceleration_unknown: true, software: false },
+    { label: "MPEG-2", mime: "video/mpeg2", advertised: true, acceleration_unknown: true, software: false },
   ],
   hdr_types: ["Dolby Vision", "HDR10", "HLG"],
   modes: [
@@ -112,32 +112,22 @@ const media: MediaCapabilities = {
   match_content_frame_rate: "2",
   verdicts: [
     {
-      level: "good",
-      title: "24p handled (23.976 Hz mode available)",
+      level: "info",
+      title: "24p mode reported (23.976 Hz)",
       detail:
-        "Match Content Frame Rate is set to Always, so film switches to its native cadence instead of being pulled to the panel rate.",
-      note: null,
+        "A matching display mode is available. Actual switching depends on the player, device, and display; this setting alone does not guarantee film-rate output.",
     },
     {
       level: "info",
       title: "Surround passthrough is on a manual allow-list",
       detail:
-        "Only these pass through: Dolby Digital (AC-3), Dolby Digital Plus (E-AC-3), Dolby Atmos over DD+ (E-AC-3 JOC), Dolby TrueHD, DTS, DTS-HD. Anything else is decoded on the device.",
-      note: null,
+        "Android is configured with an explicit format list. Actual output still depends on the player and connected equipment.",
     },
     {
-      level: "good",
-      title: "Dolby Vision available",
+      level: "info",
+      title: "Configuration, not a playback test",
       detail:
-        "The device advertises a Dolby Vision decoder and the display chain accepts Dolby Vision.",
-      note: "Profiles 5 and 8 play natively. Profile 7 — the dual-layer format UHD Blu-ray remuxes use — plays the base layer only: the enhancement layer is discarded, so FEL titles render from a base grade that was never meant to be shown alone. Converting Profile 7 to 8.1 before playback avoids that.",
-    },
-    {
-      level: "warn",
-      title: "AV1 in software only",
-      detail:
-        "No hardware AV1 decoder is advertised. AV1 falls back to CPU decoding, which stutters above 1080p on TV-class silicon.",
-      note: "The Shield's Tegra X1/X1+ has no AV1 decode block, and no firmware update can add one. AV1 streams fall back to software decoding — fine at 1080p, unreliable above it.",
+        "Codec entries describe available configuration. They do not verify runtime registration, acceleration, profiles, DRM, or playback performance.",
     },
   ],
 };
@@ -385,8 +375,7 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
     case "resource_sample":
       return {
         cpu_percent: 18.4,
-        rx_bytes_per_s: 11_534_336,
-        tx_bytes_per_s: 204_800,
+        interfaces: [{ name: "eth0", rx_bytes_per_s: 11_534_336, tx_bytes_per_s: 204_800 }],
         interval_ms: 1000,
       };
     case "run_shell": {
@@ -399,6 +388,7 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
           stdout: "",
           stderr: "",
           exit_code: null,
+          termination: "completed",
           blocked: true,
           blocked_reason:
             "Refused: this command would disable or remove com.android.systemui, which is on the do-not-disable list. System UI — the launcher's host process. Disabling makes the device unusable.",
@@ -408,6 +398,7 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
         stdout: demoShellOutput(command),
         stderr: "",
         exit_code: 0,
+        termination: "completed",
         blocked: false,
         blocked_reason: null,
       };
@@ -446,6 +437,7 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
           "secure.match_content_frame_rate": "2",
           "global.window_animation_scale": "0.5",
         },
+        settings_to_delete: ["global.encoded_surround_output"],
         settings_already_set: ["global.transition_animation_scale", "global.animator_duration_scale"],
         cross_device_warning: null,
       };
@@ -456,8 +448,9 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
         launcher_set: true,
         launcher_message: "Set Projectivy as default.",
         settings_written: ["global.hdmi_control_enabled", "secure.match_content_frame_rate"],
+        settings_deleted: ["global.encoded_surround_output"],
         settings_failed: [],
-        summary: "Applied snapshot: 2 disabled, launcher set, 2 settings written.",
+        summary: "Applied snapshot: 2 disabled, launcher set, 2 settings written, 1 reset.",
       };
     case "prepare_optimize":
       return optimizePlan((args.mode as "optimize" | "restore") ?? "optimize");

@@ -89,61 +89,23 @@ export interface DisplayMode {
   hdr_types: string[];
 }
 
-/// Counterparts of crates/core/src/engine/media.rs.
-export type SurroundMode = "auto" | "never" | "always" | "manual" | "unset";
-export type VerdictLevel = "good" | "warn" | "info";
-
-export interface VideoFormat {
-  label: string;
-  mime: string;
-  /// A vendor (silicon-backed) decoder advertises it.
-  hardware: boolean;
-  /// A platform software decoder advertises it.
-  software: boolean;
-}
-
-export interface DisplayModeEntry {
-  width: number;
-  height: number;
-  fps: number;
-  active: boolean;
-}
-
-export interface AudioPassthrough {
-  mode: SurroundMode;
-  enabled_formats: string[];
-  raw_formats: string | null;
-}
-
-export interface Verdict {
-  level: VerdictLevel;
-  title: string;
-  detail: string;
-  /// Curated per-device knowledge, rendered apart from the derived detail.
-  note: string | null;
-}
-
-export interface MediaCapabilities {
-  video: VideoFormat[];
-  hdr_types: string[];
-  modes: DisplayModeEntry[];
-  audio: AudioPassthrough;
-  match_content_frame_rate: string | null;
-  verdicts: Verdict[];
-}
+export type {
+  SurroundMode, VerdictLevel, VideoFormat, DisplayModeEntry,
+  AudioPassthrough, Verdict, MediaCapabilities,
+} from "../../shared/media";
 
 /// CPU + network rates over one device-side sampling window.
 export interface ResourceSample {
   cpu_percent: number | null;
-  rx_bytes_per_s: number | null;
-  tx_bytes_per_s: number | null;
-  interval_ms: number;
+  interfaces: { name: string; rx_bytes_per_s: number | null; tx_bytes_per_s: number | null }[];
+  interval_ms: number | null;
 }
 
 export interface ShellRunResult {
   stdout: string;
   stderr: string;
   exit_code: number | null;
+  termination: "completed" | "output_limit" | "timeout";
   /// The safety gate refused it; nothing was sent to the device.
   blocked: boolean;
   blocked_reason: string | null;
@@ -339,6 +301,7 @@ export interface SnapshotApplyPlan {
   packages_not_installed: string[];
   launcher_to_set: string | null;
   settings_to_write: Record<string, string>;
+  settings_to_delete: string[];
   settings_already_set: string[];
   cross_device_warning: string | null;
 }
@@ -349,6 +312,7 @@ export interface ApplyResult {
   launcher_set: boolean;
   launcher_message: string | null;
   settings_written: string[];
+  settings_deleted: string[];
   settings_failed: string[];
   summary: string;
 }

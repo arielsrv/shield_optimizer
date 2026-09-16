@@ -19,6 +19,14 @@ When you add a new section, put it at the top; older releases go below.
 
 ## v2-2.2.0-beta.1
 
+### Playback and expert diagnostics
+
+- Desktop and mobile report advertised video decoders, display modes, HDR formats, and audio policy without treating configuration files as proof of runtime playback support.
+- CPU and per-interface network samples use the device's measured sampling interval. Mobile sampling is on demand.
+- Audio passthrough controls preserve unknown format codes and serialize changes through readback. Mobile reads remain Free and writes require Pro.
+- Desktop expert shell requires explicit acknowledgment, bounds output and execution time, and retains nonzero exit status and partial output. Presets and bookmarks only fill the editor. Arbitrary shell is an explicit exception to protected-package guarantees; mobile shell is not exposed.
+- New snapshots record absent settings separately from empty values so restoring device defaults is reversible. Older snapshots preserve their original omission-as-no-op behavior.
+
 Four reported bugs reach users for the first time, plus safer defaults and a
 companion-app overhaul. Three of these fixes were written without the
 reporter's hardware in hand — if you filed one of them, please say whether this

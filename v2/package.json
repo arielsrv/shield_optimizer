@@ -12,6 +12,7 @@
     "test:app-files-catalog": "node tests/app-files-catalog.mjs",
     "test:pairing-flow": "node tests/pairing-flow.mjs",
     "test:sideload-scan": "node tests/sideload-scan.mjs",
+    "test:playback-shell": "node tests/playback-shell.mjs",
     "screenshots": "node screenshots/capture.mjs && bash screenshots/build-gif.sh",
     "tauri": "tauri"
   },

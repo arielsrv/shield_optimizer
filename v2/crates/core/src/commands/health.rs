@@ -51,8 +51,8 @@ pub async fn health_report(
 /// The file is split across vendor / system / product partitions and its exact
 /// path differs per build, so globbing all the plausible locations at once is
 /// both cheaper and more portable than probing them in turn. Unmatched globs
-/// and missing files fail silently — `batch_command` already discards stderr,
-/// and `parse_media_codecs` tolerates the concatenation of several documents.
+/// and missing files must not discard readable entries from the other paths.
+/// The trailing no-op preserves that partial output in a checked batch.
 ///
 /// `/vendor/odm/etc` and `/odm/etc` are not optional extras: they are where a
 /// Shield TV Pro (mdarcy, Android 11) actually keeps the file — `/vendor/etc`
@@ -62,32 +62,23 @@ pub async fn health_report(
 const MEDIA_CODECS_GLOB: &str = "cat /vendor/etc/media_codecs*.xml \
                                  /vendor/odm/etc/media_codecs*.xml /odm/etc/media_codecs*.xml \
                                  /system/etc/media_codecs*.xml /etc/media_codecs*.xml \
-                                 /product/etc/media_codecs*.xml";
+                                 /product/etc/media_codecs*.xml; :";
 
-/// `media_report` — what this device can actually decode and output.
-///
-/// `device_type` comes from the caller rather than a fresh `getprop` round
-/// trip: the frontend already holds the profiled device, and re-deriving it
-/// here would fork the single canonical detection path.
+/// Device-reported codec configuration, display modes, and audio settings.
 #[tauri::command]
 pub async fn media_report(
     state: State<'_, AppState>,
     serial: String,
-    device_type: crate::engine::DeviceType,
 ) -> Result<MediaCapabilities, String> {
-    media_report_for(state.inner(), &serial, device_type).await
+    media_report_for(state.inner(), &serial).await
 }
 
-async fn media_report_for(
-    state: &AppState,
-    serial: &str,
-    device_type: crate::engine::DeviceType,
-) -> Result<MediaCapabilities, String> {
+async fn media_report_for(state: &AppState, serial: &str) -> Result<MediaCapabilities, String> {
     use std::time::Duration;
     use tokio::time::timeout;
 
     let adb = state.adb_snapshot().await;
-    let cmd = batch_command(&[
+    let cmd = crate::adb::batch::checked_batch_command(&[
         "dumpsys display",
         MEDIA_CODECS_GLOB,
         "settings get global encoded_surround_output",
@@ -101,10 +92,7 @@ async fn media_report_for(
         .map_err(|e| format!("media report: {e}"))?
         .stdout;
 
-    let sections = split_batch(&batched, 5);
-    if sections.iter().all(|section| section.trim().is_empty()) {
-        return Err("The TV returned no playback data. Retry the report.".into());
-    }
+    let sections = crate::adb::batch::parse_checked_batch(&batched, 5, &[2, 3, 4])?;
 
     // A `settings get` on an unset key prints the literal "null"; treat that
     // and an empty section as "not set" so the engine sees `None` either way.
@@ -122,7 +110,6 @@ async fn media_report_for(
             setting(&sections[3]).as_deref(),
         ),
         setting(&sections[4]),
-        device_type,
     ))
 }
 
@@ -132,23 +119,23 @@ pub struct ResourceSample {
     /// Aggregate CPU busy time across the window, 0-100. `None` when
     /// `/proc/stat` was unreadable or the counters did not advance.
     pub cpu_percent: Option<f64>,
-    pub rx_bytes_per_s: Option<u64>,
-    pub tx_bytes_per_s: Option<u64>,
-    /// The nominal sampling window, so the UI can label the reading.
-    pub interval_ms: u64,
+    pub interfaces: Vec<InterfaceRate>,
+    pub interval_ms: Option<u64>,
 }
 
-/// Device-side sampling window. Both samples and the sleep between them run
-/// inside one shell, so the delta is measured on the device and Wi-Fi latency
-/// never lands in the denominator.
-const SAMPLE_INTERVAL_MS: u64 = 1000;
+#[derive(Serialize)]
+pub struct InterfaceRate {
+    pub name: String,
+    pub rx_bytes_per_s: Option<u64>,
+    pub tx_bytes_per_s: Option<u64>,
+}
 
 /// `resource_sample` — CPU % and network throughput.
 ///
 /// Deliberately *not* folded into `health_report`: rate counters need two
 /// reads a second apart, and charging every health refresh an extra second of
 /// wall clock to carry two numbers would be a bad trade. The Health tab calls
-/// this separately and can poll it without re-running the whole report.
+/// this separately without re-running the whole report.
 #[tauri::command]
 pub async fn resource_sample(
     state: State<'_, AppState>,
@@ -162,10 +149,12 @@ async fn resource_sample_for(state: &AppState, serial: &str) -> Result<ResourceS
     use tokio::time::timeout;
 
     let adb = state.adb_snapshot().await;
-    let cmd = batch_command(&[
+    let cmd = crate::adb::checked_batch_command(&[
+        "cat /proc/uptime",
         "cat /proc/stat",
         "cat /proc/net/dev",
-        &format!("sleep {}", SAMPLE_INTERVAL_MS as f64 / 1000.0),
+        "sleep 1",
+        "cat /proc/uptime",
         "cat /proc/stat",
         "cat /proc/net/dev",
     ]);
@@ -176,39 +165,48 @@ async fn resource_sample_for(state: &AppState, serial: &str) -> Result<ResourceS
         .map_err(|e| format!("resource sample: {e}"))?
         .stdout;
 
-    let sections = split_batch(&batched, 5);
-
-    // Counter deltas use saturating subtraction throughout: an interface going
-    // down mid-window (or a 32-bit counter wrapping) would otherwise underflow
-    // into a nonsense spike rather than reading as zero.
-    let cpu_percent = match (parse_proc_stat(&sections[0]), parse_proc_stat(&sections[3])) {
-        (Some(a), Some(b)) => {
-            let total = b.total.saturating_sub(a.total);
-            let busy = b.busy.saturating_sub(a.busy);
-            (total > 0).then(|| ((busy as f64 / total as f64) * 1000.0).round() / 10.0)
-        }
+    let sections = crate::adb::parse_checked_batch(&batched, 7, &[3])?;
+    let uptime = |raw: &str| raw.split_whitespace().next()?.parse::<f64>().ok();
+    let elapsed = uptime(&sections[0])
+        .zip(uptime(&sections[4]))
+        .filter(|(a, b)| a.is_finite() && b.is_finite() && *a >= 0.0 && b > a)
+        .map(|(a, b)| b - a);
+    let cpu_percent = match (parse_proc_stat(&sections[1]), parse_proc_stat(&sections[5])) {
+        (Some(a), Some(b)) => b
+            .total
+            .checked_sub(a.total)
+            .zip(b.busy.checked_sub(a.busy))
+            .filter(|(total, busy)| *total > 0 && busy <= total)
+            .map(|(total, busy)| ((busy as f64 / total as f64) * 1000.0).round() / 10.0),
         _ => None,
     };
 
-    let (rx_bytes_per_s, tx_bytes_per_s) =
-        match (parse_net_dev(&sections[1]), parse_net_dev(&sections[4])) {
-            (Some(a), Some(b)) => {
-                let per_s = |later: u64, earlier: u64| {
-                    later.saturating_sub(earlier) * 1000 / SAMPLE_INTERVAL_MS
-                };
-                (
-                    Some(per_s(b.rx_bytes, a.rx_bytes)),
-                    Some(per_s(b.tx_bytes, a.tx_bytes)),
-                )
+    let first = parse_net_dev(&sections[2]);
+    let second = parse_net_dev(&sections[6]);
+    let names: std::collections::BTreeSet<_> = first.keys().chain(second.keys()).collect();
+    let interfaces = names
+        .into_iter()
+        .map(|name| {
+            let rates = first.get(name).zip(second.get(name)).zip(elapsed);
+            let rate = |later: u64, earlier: u64, seconds: f64| {
+                later
+                    .checked_sub(earlier)
+                    .map(|delta| (delta as f64 / seconds).round() as u64)
+            };
+            InterfaceRate {
+                name: name.clone(),
+                rx_bytes_per_s: rates
+                    .and_then(|((a, b), seconds)| rate(b.rx_bytes, a.rx_bytes, seconds)),
+                tx_bytes_per_s: rates
+                    .and_then(|((a, b), seconds)| rate(b.tx_bytes, a.tx_bytes, seconds)),
             }
-            _ => (None, None),
-        };
+        })
+        .collect();
 
     Ok(ResourceSample {
         cpu_percent,
-        rx_bytes_per_s,
-        tx_bytes_per_s,
-        interval_ms: SAMPLE_INTERVAL_MS,
+        interfaces,
+        interval_ms: elapsed.map(|seconds| (seconds * 1000.0).round() as u64),
     })
 }
 
@@ -508,16 +506,95 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
         assert!(MEDIA_CODECS_GLOB.contains("/vendor/etc/media_codecs"));
     }
 
+    fn media_batch(sections: &[(&str, i32)]) -> String {
+        sections
+            .iter()
+            .map(|(body, status)| format!("{body}\n{}{status}", crate::adb::batch::BATCH_STATUS))
+            .collect::<Vec<_>>()
+            .join(&format!("\n{BATCH_SEPARATOR}\n"))
+    }
+
+    #[tokio::test]
+    async fn media_report_rejects_failed_and_truncated_settings_reads() {
+        for index in 2..5 {
+            let mut sections = [
+                (DISPLAY, 0),
+                (CODECS, 0),
+                ("null", 0),
+                ("null", 0),
+                ("null", 0),
+            ];
+            sections[index] = ("", 1);
+            let state =
+                state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &media_batch(&sections)));
+            assert!(media_report_for(&state, "serial")
+                .await
+                .unwrap_err()
+                .contains("failed"));
+
+            sections[index] = ("Error: settings unavailable", 0);
+            let state =
+                state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &media_batch(&sections)));
+            assert!(media_report_for(&state, "serial")
+                .await
+                .unwrap_err()
+                .contains("reported an error"));
+        }
+        let complete = media_batch(&[
+            (DISPLAY, 0),
+            (CODECS, 0),
+            ("null", 0),
+            ("null", 0),
+            ("null", 0),
+        ]);
+        let truncated = complete
+            .rsplit_once(crate::adb::batch::BATCH_STATUS)
+            .unwrap()
+            .0;
+        let state = state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, truncated));
+        assert!(media_report_for(&state, "serial")
+            .await
+            .unwrap_err()
+            .contains("did not complete"));
+    }
+
+    #[tokio::test]
+    async fn media_report_keeps_codecs_when_optional_display_read_fails() {
+        let state = state_with(MockAdb::default().on_shell(
+            BATCH_SEPARATOR,
+            &media_batch(&[("", 1), (CODECS, 0), ("null", 0), ("null", 0), ("null", 0)]),
+        ));
+        let caps = media_report_for(&state, "serial").await.unwrap();
+        assert!(caps.modes.is_empty());
+        assert!(caps.video.iter().any(|v| v.advertised));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codec_glob_preserves_readable_xml_among_missing_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("readable.xml"), CODECS).unwrap();
+        let command = MEDIA_CODECS_GLOB.replacen("cat ", "cat readable.xml ", 1);
+        let output = std::process::Command::new("sh")
+            .current_dir(directory.path())
+            .args(["-c", &crate::adb::batch::checked_batch_command(&[&command])])
+            .output()
+            .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        let sections = crate::adb::batch::parse_checked_batch(&text, 1, &[0]).unwrap();
+        assert!(!parse_media_codecs(&sections[0]).is_empty());
+    }
+
     #[tokio::test]
     async fn media_report_decodes_every_section_from_one_round_trip() {
         let mock = MockAdb::default().on_shell(
             BATCH_SEPARATOR,
-            &batched(&[DISPLAY, CODECS, "3", "5,6,14", "2"]),
+            &media_batch(&[(DISPLAY, 0), (CODECS, 0), ("3", 0), ("5,6,14", 0), ("2", 0)]),
         );
         let log = mock.shell_log();
         let state = state_with(mock);
 
-        let caps = media_report_for(&state, "serial", crate::engine::DeviceType::Shield)
+        let caps = media_report_for(&state, "serial")
             .await
             .unwrap_or_else(|e| panic!("media report: {e}"));
 
@@ -533,9 +610,9 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
             .any(|f| f.contains("TrueHD")));
 
         let hevc = caps.video.iter().find(|v| v.mime == "video/hevc").unwrap();
-        assert!(hevc.hardware);
+        assert!(hevc.advertised && hevc.acceleration_unknown);
         let av1 = caps.video.iter().find(|v| v.mime == "video/av01").unwrap();
-        assert!(!av1.hardware && av1.software);
+        assert!(av1.advertised && av1.software);
 
         let calls = log.lock().unwrap();
         assert_eq!(
@@ -552,11 +629,15 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
         // not reach the engine as the string "null".
         let state = state_with(MockAdb::default().on_shell(
             BATCH_SEPARATOR,
-            &batched(&[DISPLAY, CODECS, "null", "null", "null"]),
+            &media_batch(&[
+                (DISPLAY, 0),
+                (CODECS, 0),
+                ("null", 0),
+                ("null", 0),
+                ("null", 0),
+            ]),
         ));
-        let caps = media_report_for(&state, "serial", crate::engine::DeviceType::Shield)
-            .await
-            .unwrap();
+        let caps = media_report_for(&state, "serial").await.unwrap();
         assert_eq!(caps.match_content_frame_rate, None);
         assert_eq!(caps.audio.mode, crate::engine::SurroundMode::Unset);
         assert_eq!(caps.audio.raw_formats, None);
@@ -565,12 +646,11 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
     #[tokio::test]
     async fn media_report_survives_an_unreadable_codec_file() {
         // Everything else still renders, and nothing is claimed about codecs.
-        let state = state_with(
-            MockAdb::default().on_shell(BATCH_SEPARATOR, &batched(&[DISPLAY, "", "0", "", "2"])),
-        );
-        let caps = media_report_for(&state, "serial", crate::engine::DeviceType::Shield)
-            .await
-            .unwrap();
+        let state = state_with(MockAdb::default().on_shell(
+            BATCH_SEPARATOR,
+            &media_batch(&[(DISPLAY, 0), ("", 0), ("0", 0), ("", 0), ("2", 0)]),
+        ));
+        let caps = media_report_for(&state, "serial").await.unwrap();
         assert_eq!(caps.modes.len(), 2);
         assert!(caps
             .verdicts
@@ -582,11 +662,7 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
     #[tokio::test]
     async fn media_report_errors_when_the_device_returns_nothing() {
         let state = state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, ""));
-        assert!(
-            media_report_for(&state, "serial", crate::engine::DeviceType::Shield)
-                .await
-                .is_err()
-        );
+        assert!(media_report_for(&state, "serial").await.is_err());
     }
 
     const STAT_A: &str = "cpu  100 0 100 800 0 0 0 0";
@@ -594,11 +670,19 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
     const NET_A: &str = "  eth0: 1000 5 0 0 0 0 0 0 500 3 0 0 0 0 0 0";
     const NET_B: &str = "  eth0: 3000 9 0 0 0 0 0 0 1500 7 0 0 0 0 0 0";
 
+    fn resource_batch(parts: &[&str]) -> String {
+        parts
+            .iter()
+            .map(|part| format!("{part}\n{}0", crate::adb::batch::BATCH_STATUS))
+            .collect::<Vec<_>>()
+            .join(&format!("\n{BATCH_SEPARATOR}\n"))
+    }
+
     #[tokio::test]
     async fn resource_sample_derives_rates_from_two_device_side_reads() {
         let mock = MockAdb::default().on_shell(
             BATCH_SEPARATOR,
-            &batched(&[STAT_A, NET_A, "", STAT_B, NET_B]),
+            &resource_batch(&["100.00 0", STAT_A, NET_A, "", "102.00 0", STAT_B, NET_B]),
         );
         let log = mock.shell_log();
         let state = state_with(mock);
@@ -606,8 +690,10 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
         let sample = resource_sample_for(&state, "serial").await.unwrap();
         // busy delta 200, total delta 1000 → 20%.
         assert_eq!(sample.cpu_percent, Some(20.0));
-        assert_eq!(sample.rx_bytes_per_s, Some(2000));
-        assert_eq!(sample.tx_bytes_per_s, Some(1000));
+        assert_eq!(sample.interval_ms, Some(2000));
+        assert_eq!(sample.interfaces[0].name, "eth0");
+        assert_eq!(sample.interfaces[0].rx_bytes_per_s, Some(1000));
+        assert_eq!(sample.interfaces[0].tx_bytes_per_s, Some(500));
 
         let calls = log.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -624,24 +710,71 @@ fps=59.94006}], HdrCapabilities{mSupportedHdrTypes=[1, 2, 3]}}";
         // CPU samples must not produce negative or infinite rates.
         let state = state_with(MockAdb::default().on_shell(
             BATCH_SEPARATOR,
-            &batched(&[STAT_A, NET_B, "", STAT_A, NET_A]),
+            &resource_batch(&["100 0", STAT_A, NET_B, "", "101 0", STAT_A, NET_A]),
         ));
         let sample = resource_sample_for(&state, "serial").await.unwrap();
         assert_eq!(
             sample.cpu_percent, None,
             "no elapsed jiffies means no reading"
         );
-        assert_eq!(sample.rx_bytes_per_s, Some(0));
-        assert_eq!(sample.tx_bytes_per_s, Some(0));
+        assert_eq!(sample.interfaces[0].rx_bytes_per_s, None);
+        assert_eq!(sample.interfaces[0].tx_bytes_per_s, None);
     }
 
     #[tokio::test]
     async fn resource_sample_degrades_when_proc_is_unreadable() {
-        let state = state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &batched(&["", ""])));
+        let response = resource_batch(&["", "", "", "", "", "", ""]).replacen(
+            &format!("{}0", crate::adb::batch::BATCH_STATUS),
+            &format!("{}1", crate::adb::batch::BATCH_STATUS),
+            1,
+        );
+        let state = state_with(MockAdb::default().on_shell(BATCH_SEPARATOR, &response));
         let sample = resource_sample_for(&state, "serial").await.unwrap();
         assert_eq!(sample.cpu_percent, None);
-        assert_eq!(sample.rx_bytes_per_s, None);
-        assert_eq!(sample.interval_ms, SAMPLE_INTERVAL_MS);
+        assert!(sample.interfaces.is_empty());
+        assert_eq!(sample.interval_ms, None);
+    }
+
+    #[tokio::test]
+    async fn resource_sample_keeps_tunnels_separate_and_missing_interfaces_unknown() {
+        let net_a = format!("{NET_A}\ntun0: 1000 0 0 0 0 0 0 0 500\nwlan0: 100 0 0 0 0 0 0 0 100");
+        let net_b = format!("{NET_B}\ntun0: 3000 0 0 0 0 0 0 0 1500\nwlan1: 100 0 0 0 0 0 0 0 100");
+        let state = state_with(MockAdb::default().on_shell(
+            BATCH_SEPARATOR,
+            &resource_batch(&["100 0", STAT_A, &net_a, "", "101 0", STAT_B, &net_b]),
+        ));
+        let sample = resource_sample_for(&state, "serial").await.unwrap();
+        assert_eq!(sample.interfaces.len(), 4);
+        assert_eq!(sample.interfaces[0].rx_bytes_per_s, Some(2000));
+        assert_eq!(sample.interfaces[1].rx_bytes_per_s, Some(2000));
+        assert_eq!(sample.interfaces[2].rx_bytes_per_s, None);
+        assert_eq!(sample.interfaces[3].rx_bytes_per_s, None);
+    }
+
+    #[tokio::test]
+    async fn resource_sample_rejects_invalid_cpu_deltas_and_elapsed_time() {
+        for (uptime, stat) in [
+            ("99 0", STAT_A),
+            ("NaN 0", "cpu 300 0 300 500 0 0 0 0"),
+            ("", "cpu 0 0 0 0"),
+        ] {
+            let state = state_with(MockAdb::default().on_shell(
+                BATCH_SEPARATOR,
+                &resource_batch(&["100 0", STAT_A, NET_A, "", uptime, stat, NET_B]),
+            ));
+            let sample = resource_sample_for(&state, "serial").await.unwrap();
+            assert_eq!(sample.cpu_percent, None);
+            assert_eq!(sample.interval_ms, None);
+            assert_eq!(sample.interfaces[0].rx_bytes_per_s, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_sample_rejects_truncated_batches() {
+        let state = state_with(
+            MockAdb::default().on_shell(BATCH_SEPARATOR, &resource_batch(&["100 0", STAT_A])),
+        );
+        assert!(resource_sample_for(&state, "serial").await.is_err());
     }
 
     #[tokio::test]

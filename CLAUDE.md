@@ -50,7 +50,7 @@ These are load-bearing — break them and the safety story falls over.
 - **App lists live in JSON, not in code.** Add/edit packages in `v2/crates/core/data/app-lists/{common,shield,googletv}.json`. They are embedded at compile time via `include_str!` in `crates/core/src/commands/loader.rs` — editing the JSON requires a rebuild. Never hard-code packages in Rust.
 - **Snapshots are versioned.** `schema_version == 0` is rejected. `schema_version > current` is rejected. Bump the constant in `engine/snapshot.rs` when the schema changes and write an explicit migration.
 - **Snapshot reads are path-confined** to `snapshot_dir` via `canonicalize` + `starts_with`. Keep that check on any new read path that takes a user-supplied snapshot location — zip-slip / traversal protection is the same pattern in `adb/install.rs`.
-- **The do-not-disable list is mandatory.** `engine::safety::classify` / `is_never_disable` must gate every disable code path (apply-snapshot, optimize wizard, memory-table Disable button, stock-launcher wizard, panic-recovery's inverse, …). Bypassing it bricks devices.
+- **The do-not-disable list is mandatory for curated actions.** `engine::safety::classify` / `is_never_disable` must gate every typed disable code path (apply-snapshot, optimize wizard, memory-table Disable button, stock-launcher wizard, panic-recovery's inverse, …). Desktop expert shell is an explicit opt-in exception: arbitrary shell expressions can bypass its lexical checks. It must remain bounded, clearly warn about destructive effects, and never claim the curated actions' safety guarantee. Mobile does not expose it.
 - **Tauri commands return `Result<T, String>`.** The error type is serialized to the frontend. Convert with `.map_err(|e| e.to_string())`.
 - **Frontend is Svelte 5 runes** (`$state`, `$derived`, `$effect`, `$props`) on SvelteKit in SPA mode (`adapter-static`). No legacy stores.
 
@@ -80,7 +80,7 @@ The Linux runner needs `libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana
 The README walkthrough (`v2/screenshots/gallery.gif`) is generated, not hand-captured. **When you change v2 UI in a way that alters any captured screen, regenerate it and commit the result** — don't let the gallery drift from the real app:
 
 ```
-cd v2 && npm run screenshots   # captures all 14 screens (demo data, dark theme) + rebuilds the GIF
+cd v2 && npm run screenshots   # captures 15 screens in both themes and rebuilds both GIFs
 ```
 
 It runs offline against the demo fixture layer (`src/lib/demo-mock.ts`, gated behind `VITE_DEMO=1`) — no device needed. Most changes (CSS, layout, copy, rows) flow through with no tooling edits. Two cases need a touch-up:

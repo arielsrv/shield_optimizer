@@ -159,6 +159,7 @@
     pending != null &&
       pending.plan.packages_to_disable.length === 0 &&
       settingsToWrite.length === 0 &&
+      pending.plan.settings_to_delete.length === 0 &&
       pending.plan.launcher_to_set == null,
   );
 </script>
@@ -322,6 +323,10 @@
                     {pending.plan.settings_already_set.length} already match
                   </span>
                 {/if}
+                <span class="plan-line">Reset {pending.plan.settings_to_delete.length} settings to device defaults</span>
+                {#each pending.plan.settings_to_delete as key (key)}
+                  <span class="plan-sub mono">{key}: delete override</span>
+                {/each}
               </div>
             </div>
           </div>
@@ -329,7 +334,7 @@
 
         <p class="plan-note">
           Applying re-disables the recorded packages, sets the recorded launcher and writes the
-          recorded settings. It does not re-enable, reinstall or restore anything the snapshot
+          recorded settings, including resetting recorded absent settings to device defaults. It does not re-enable, reinstall or restore anything the snapshot
           didn't record.
         </p>
 

@@ -48,7 +48,16 @@ pub fn is_never_disable(package: &str) -> bool {
 /// way the never-disable list exists to prevent — `hide` and `suspend` are
 /// included because they reach the same end state as `disable` by another
 /// name.
-const DESTRUCTIVE_VERBS: &[&str] = &["disable", "disable-user", "uninstall", "hide", "suspend"];
+const DESTRUCTIVE_VERBS: &[&str] = &[
+    "disable",
+    "disable-user",
+    "disable-until-used",
+    "uninstall",
+    "uninstall-system-updates",
+    "clear",
+    "hide",
+    "suspend",
+];
 
 /// Guard for the free-form shell runner: does this command *obviously* try to
 /// take a never-disable package away?
@@ -87,8 +96,7 @@ const DESTRUCTIVE_VERBS: &[&str] = &["disable", "disable-user", "uninstall", "hi
 ///
 /// Returns the reason to show the user, or `None` when the command is clear.
 pub fn shell_command_blocked(command: &str) -> Option<(String, &'static str)> {
-    // Split on everything that separates or delimits an argument, so quoting
-    // and chaining cannot smuggle a package past the token comparison.
+    // This recognizes literal arguments, not shell expansion or evaluation.
     let tokens: Vec<&str> = command
         .split(|c: char| {
             c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '\'' | '"' | '`')
@@ -102,9 +110,10 @@ pub fn shell_command_blocked(command: &str) -> Option<(String, &'static str)> {
     if !has_verb {
         return None;
     }
-    tokens
-        .iter()
-        .find_map(|t| never_disable_reason(t).map(|reason| ((*t).to_string(), reason)))
+    tokens.iter().find_map(|t| {
+        let package = t.split('/').next().unwrap_or(t);
+        never_disable_reason(package).map(|reason| (package.to_string(), reason))
+    })
 }
 
 fn never_disable_reason(package: &str) -> Option<&'static str> {
@@ -301,6 +310,18 @@ mod tests {
             shell_command_blocked("pm disable-user --user 0 com.android.systemui").unwrap();
         assert_eq!(pkg, "com.android.systemui");
         assert!(reason.contains("System UI"));
+    }
+
+    #[test]
+    fn shell_runner_blocks_literal_clear_updates_and_component_targets() {
+        for command in [
+            "pm clear com.android.systemui",
+            "pm uninstall-system-updates com.android.settings",
+            "pm disable-user com.android.systemui/.SystemUIService",
+            "pm disable-until-used com.android.shell",
+        ] {
+            assert!(shell_command_blocked(command).is_some(), "{command}");
+        }
     }
 
     #[test]

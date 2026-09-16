@@ -19,6 +19,7 @@ use crate::engine::shell_command_blocked;
 use crate::license::Feature;
 
 use super::AppState;
+use crate::adb::driver::ShellTermination;
 
 /// Result of one shell invocation. Both streams are surfaced because on-device
 /// tools (`pm`, `settings`, `cmd`) split their output across them
@@ -28,17 +29,12 @@ pub struct ShellRunResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+    pub termination: ShellTermination,
     /// The safety gate refused to run this. Nothing was sent to the device.
     pub blocked: bool,
     /// Why it was refused, when `blocked`.
     pub blocked_reason: Option<String>,
 }
-
-/// Cap on returned output. A stray `logcat` or `dumpsys` with no filter can
-/// emit tens of megabytes; the frontend has to render whatever comes back, so
-/// the truncation happens here rather than after it has crossed the IPC
-/// boundary and blown up the webview.
-const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// `run_shell` — run an arbitrary command on the device.
 #[tauri::command]
@@ -66,9 +62,10 @@ async fn run_shell_impl(
             stdout: String::new(),
             stderr: String::new(),
             exit_code: None,
+            termination: ShellTermination::Completed,
             blocked: true,
             blocked_reason: Some(format!(
-                "Refused: this command would disable or remove {package}, which is on the \
+                "Refused: this command could damage {package}, which is on the \
                  do-not-disable list. {reason}"
             )),
         });
@@ -76,32 +73,18 @@ async fn run_shell_impl(
 
     let adb = state.adb_snapshot().await;
     let out = adb
-        .shell(serial, trimmed)
+        .shell_bounded(serial, trimmed)
         .await
-        .map_err(|e| format!("{trimmed}: {e}"))?;
+        .map_err(|e| e.to_string())?;
 
     Ok(ShellRunResult {
-        stdout: truncate(out.stdout),
-        stderr: truncate(out.stderr),
+        stdout: out.stdout,
+        stderr: out.stderr,
         exit_code: out.exit_code,
+        termination: out.termination,
         blocked: false,
         blocked_reason: None,
     })
-}
-
-/// Trim to [`MAX_OUTPUT_BYTES`] on a char boundary, with a visible marker so a
-/// truncated dump is never mistaken for the whole thing.
-fn truncate(mut s: String) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
-        return s;
-    }
-    let mut cut = MAX_OUTPUT_BYTES;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s.truncate(cut);
-    s.push_str("\n… output truncated at 256 KB …");
-    s
 }
 
 #[cfg(test)]
@@ -202,19 +185,5 @@ mod tests {
         let state = state_with(MockAdb::default().on_shell_err("id", "device offline"));
         let err = run_shell_impl(&state, "serial", "id").await.unwrap_err();
         assert!(err.contains("device offline"));
-    }
-
-    #[test]
-    fn oversized_output_is_truncated_on_a_char_boundary_and_marked() {
-        // Multi-byte chars straddling the cut would panic a naive truncate.
-        let huge = "é".repeat(MAX_OUTPUT_BYTES);
-        let out = truncate(huge);
-        assert!(out.len() < MAX_OUTPUT_BYTES + 64);
-        assert!(out.ends_with("… output truncated at 256 KB …"));
-    }
-
-    #[test]
-    fn output_under_the_cap_is_returned_untouched() {
-        assert_eq!(truncate("short".into()), "short");
     }
 }

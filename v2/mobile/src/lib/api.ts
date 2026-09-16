@@ -9,6 +9,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { parseSafety } from "../../../shared/safety";
+import type { MediaCapabilities } from "../../../shared/media";
 import { logCall, summarizeArgs } from "./log";
 import { connectionGeneration, emitConnectionLost, isConnectionLostError } from "./connectionEvents";
 import type {
@@ -30,6 +31,7 @@ import type {
   DisplayScaleResult,
   Entitlement,
   HealthReport,
+  ResourceSample,
   LauncherStatus,
   LicenseInfo,
   OptimizeMode,
@@ -96,6 +98,8 @@ export const api = {
   // ---- Health / catalog ----
   healthReport: (serial: string) =>
     call<HealthReport>("health_report", { serial }),
+  mediaReport: (serial: string) => call<MediaCapabilities>("media_report", { serial }),
+  resourceSample: (serial: string) => call<ResourceSample>("resource_sample", { serial }),
   appListForDevice: (deviceType: DeviceType) =>
     call<AppEntry[]>("app_list_for_device", { deviceType }),
   packageStates: (serial: string, packages: string[]) =>

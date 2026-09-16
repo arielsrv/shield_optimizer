@@ -451,14 +451,38 @@ pub fn parse_storage_info(df_output: &str) -> StorageInfo {
 pub struct DisplayMode {
     pub resolution: Option<String>,
     pub refresh_hz: Option<f64>,
-    /// Decoded HDR types from `mSupportedHdrTypes=[…]`. Empty = SDR only.
+    /// Decoded HDR types from `mSupportedHdrTypes=[…]`; empty may mean unavailable.
     pub hdr_types: Vec<String>,
+}
+
+fn selected_display_record(dumpsys_display: &str) -> Option<&str> {
+    // DisplayDeviceInfo.toString emits one line, including nested mode/HDR objects.
+    let records: std::collections::BTreeSet<_> = dumpsys_display
+        .lines()
+        .filter_map(|line| line.split_once("DisplayDeviceInfo{"))
+        .map(|(_, record)| record.trim())
+        .collect();
+    if records.is_empty() {
+        return Some(dumpsys_display);
+    }
+    if records.len() == 1 {
+        return records.first().copied();
+    }
+    let mut defaults = records.into_iter().filter(|record| {
+        record
+            .split(',')
+            .any(|field| field.trim().trim_end_matches('}') == "FLAG_DEFAULT_DISPLAY")
+    });
+    let selected = defaults.next()?;
+    // ALLOWED_TO_BE_DEFAULT_DISPLAY only indicates eligibility, not selection.
+    defaults.next().is_none().then_some(selected)
 }
 
 /// Parse `dumpsys display` for the active display's resolution + refresh rate +
 /// HDR capabilities. The active mode id is in DisplayDeviceInfo; supportedModes
 /// maps id → {width, height, fps}.
 pub fn parse_display_mode(dumpsys_display: &str) -> DisplayMode {
+    let dumpsys_display = selected_display_record(dumpsys_display).unwrap_or("");
     static MODE_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"modeId\s+(\d+)").unwrap());
     static MODE_ENTRY: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"id=(\d+),\s*width=(\d+),\s*height=(\d+),\s*fps=([\d.]+)").unwrap()
@@ -528,6 +552,7 @@ pub fn parse_display_mode(dumpsys_display: &str) -> DisplayMode {
 /// distinct capabilities, not id count.
 pub fn parse_display_modes(dumpsys_display: &str) -> Vec<crate::engine::media::DisplayModeEntry> {
     use crate::engine::media::DisplayModeEntry;
+    let dumpsys_display = selected_display_record(dumpsys_display).unwrap_or("");
 
     static MODE_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"modeId\s+(\d+)").unwrap());
     static MODE_ENTRY: LazyLock<Regex> = LazyLock::new(|| {
@@ -603,37 +628,32 @@ pub fn parse_proc_stat(proc_stat: &str) -> Option<CpuSample> {
         .split_whitespace()
         .skip(1)
         .take(8)
-        .map(|v| v.parse::<u64>().unwrap_or(0))
-        .collect();
+        .map(|v| v.parse::<u64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
     if values.len() < 4 {
         return None;
     }
-    let total: u64 = values.iter().sum();
-    let idle = values[3] + values.get(4).copied().unwrap_or(0);
+    let total = values
+        .iter()
+        .try_fold(0u64, |sum, value| sum.checked_add(*value))?;
+    let idle = values[3].checked_add(values.get(4).copied().unwrap_or(0))?;
     Some(CpuSample {
-        busy: total.saturating_sub(idle),
+        busy: total - idle,
         total,
     })
 }
 
-/// Byte counters summed across every real network interface.
+/// Byte counters for one network interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetSample {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }
 
-/// Parse `/proc/net/dev`, summing all interfaces except loopback.
-///
-/// Loopback is excluded because on-device IPC (including ADB's own traffic on
-/// some transports) flows over it, which would swamp the number the user
-/// actually wants: how much is going over the wire.
-pub fn parse_net_dev(proc_net_dev: &str) -> Option<NetSample> {
-    let mut sample = NetSample {
-        rx_bytes: 0,
-        tx_bytes: 0,
-    };
-    let mut saw_interface = false;
+/// Keep interfaces separate: tunnel traffic can also appear on its physical link.
+pub fn parse_net_dev(proc_net_dev: &str) -> std::collections::BTreeMap<String, NetSample> {
+    let mut samples = std::collections::BTreeMap::new();
     for line in proc_net_dev.lines() {
         let Some((iface, counters)) = line.split_once(':') else {
             continue;
@@ -650,11 +670,15 @@ pub fn parse_net_dev(proc_net_dev: &str) -> Option<NetSample> {
         let (Ok(rx), Ok(tx)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) else {
             continue;
         };
-        saw_interface = true;
-        sample.rx_bytes += rx;
-        sample.tx_bytes += tx;
+        samples.insert(
+            iface.to_string(),
+            NetSample {
+                rx_bytes: rx,
+                tx_bytes: tx,
+            },
+        );
     }
-    saw_interface.then_some(sample)
+    samples
 }
 
 /// Parse `dumpsys audio` for the first `Devices: <name>` row — the current
@@ -967,6 +991,60 @@ DisplayDeviceInfo{"Built-in Screen": 3840 x 2160, modeId 20, defaultModeId 20, s
     }
 
     #[test]
+    fn display_reports_scope_modes_and_hdr_to_the_same_default_record() {
+        let input = concat!(
+            "DisplayDeviceInfo{\"Auxiliary\": modeId 1, supportedModes [{id=1, width=1920, height=1080, fps=24.0}], HdrCapabilities{mSupportedHdrTypes=[1]}}\n",
+            "  mInfo=DisplayDeviceInfo{\"Main\": modeId 1, supportedModes [{id=1, width=3840, height=2160, fps=60.0}], HdrCapabilities{mSupportedHdrTypes=[2]}, FLAG_DEFAULT_DISPLAY}\n",
+            "Logical display modes [{id=1, width=1280, height=720, fps=24.0}]"
+        );
+        let active = parse_display_mode(input);
+        assert_eq!(active.resolution.as_deref(), Some("3840x2160"));
+        assert_eq!(active.refresh_hz, Some(60.0));
+        assert_eq!(active.hdr_types, vec!["HDR10"]);
+        let modes = parse_display_modes(input);
+        assert_eq!(modes.len(), 1);
+        assert!(modes[0].active);
+        assert!(!modes[0].is_film_rate());
+    }
+
+    #[test]
+    fn multiple_displays_without_a_unique_default_are_unavailable() {
+        for flag in [
+            "",
+            ", FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY",
+            ", FLAG_DEFAULT_DISPLAY",
+        ] {
+            let input = format!(
+                "DisplayDeviceInfo{{\"One\": modeId 1, supportedModes [{{id=1, width=3840, height=2160, fps=60.0}}], HdrCapabilities{{mSupportedHdrTypes=[2]}}{flag}}}\n\
+                 DisplayDeviceInfo{{\"Two\": modeId 1, supportedModes [{{id=1, width=1920, height=1080, fps=24.0}}]{flag}}}"
+            );
+            assert!(parse_display_modes(&input).is_empty());
+            let active = parse_display_mode(&input);
+            assert_eq!(active.resolution, None);
+            assert_eq!(active.refresh_hz, None);
+            assert!(active.hdr_types.is_empty());
+        }
+    }
+
+    #[test]
+    fn repeated_single_display_records_do_not_create_ambiguity() {
+        let record = "DisplayDeviceInfo{\"Main\": modeId 1, supportedModes [{id=1, width=3840, height=2160, fps=60.0}], FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY}";
+        let input = format!("{record}\n  mInfo={record}");
+        assert_eq!(parse_display_modes(&input).len(), 1);
+        assert_eq!(parse_display_mode(&input).refresh_hz, Some(60.0));
+    }
+
+    #[test]
+    fn one_eligible_display_does_not_prove_the_current_default() {
+        let input = concat!(
+            "DisplayDeviceInfo{\"One\": modeId 1, supportedModes [{id=1, width=3840, height=2160, fps=60.0}], FLAG_ALLOWED_TO_BE_DEFAULT_DISPLAY}\n",
+            "DisplayDeviceInfo{\"Two\": modeId 2, supportedModes [{id=2, width=1920, height=1080, fps=24.0}]}"
+        );
+        assert!(parse_display_modes(input).is_empty());
+        assert_eq!(parse_display_mode(input).refresh_hz, None);
+    }
+
+    #[test]
     fn proc_stat_counts_iowait_as_idle() {
         // user nice system idle iowait irq softirq steal
         let sample =
@@ -985,25 +1063,33 @@ DisplayDeviceInfo{"Built-in Screen": 3840 x 2160, modeId 20, defaultModeId 20, s
     }
 
     #[test]
-    fn net_dev_sums_real_interfaces_and_skips_loopback() {
+    fn net_dev_preserves_interfaces_and_skips_loopback() {
         let input = "\
 Inter-|   Receive                                                |  Transmit\n\
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
     lo: 999999    100    0    0    0     0          0         0  999999     100    0    0    0     0       0          0\n\
   eth0: 100000    500    0    0    0     0          0         0   20000     300    0    0    0     0       0          0\n\
  wlan0:  50000    250    0    0    0     0          0         0   10000     150    0    0    0     0       0          0\n";
-        let sample = parse_net_dev(input).unwrap();
-        assert_eq!(sample.rx_bytes, 150_000);
-        assert_eq!(sample.tx_bytes, 30_000);
+        let samples = parse_net_dev(input);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples["eth0"].rx_bytes, 100_000);
+        assert_eq!(samples["wlan0"].tx_bytes, 10_000);
     }
 
     #[test]
-    fn net_dev_with_no_usable_interfaces_is_none() {
+    fn net_dev_with_no_usable_interfaces_is_empty() {
         // Header only, loopback only, and garbage all mean "no reading" —
         // distinct from a real zero, which would misreport as idle traffic.
-        assert_eq!(parse_net_dev(""), None);
-        assert_eq!(parse_net_dev("Inter-|   Receive  |  Transmit"), None);
-        assert!(parse_net_dev("    lo: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16").is_none());
+        assert!(parse_net_dev("").is_empty());
+        assert!(parse_net_dev("Inter-|   Receive  |  Transmit").is_empty());
+        assert!(parse_net_dev("    lo: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16").is_empty());
+        assert!(parse_net_dev("eth0: invalid 2 3 4 5 6 7 8 9").is_empty());
+    }
+
+    #[test]
+    fn proc_stat_rejects_invalid_or_overflowing_counters() {
+        assert_eq!(parse_proc_stat("cpu 1 bad 3 4"), None);
+        assert_eq!(parse_proc_stat("cpu 18446744073709551615 1 0 0"), None);
     }
 
     #[test]

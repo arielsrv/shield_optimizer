@@ -13,9 +13,7 @@ use super::detection::DeviceType;
 
 /// Current snapshot schema version. Bump when the structure changes; the
 /// reader will refuse future versions explicitly.
-// v2 added the optional `label` field. v1 snapshots still load (label
-// defaults to None via serde) — that's the migration; no transform needed.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Setting keys we track in a snapshot — matches v1's `$Script:SnapshotSettingKeys`.
 pub fn tracked_setting_keys() -> &'static [(&'static str, &'static str)] {
@@ -29,9 +27,6 @@ pub fn tracked_setting_keys() -> &'static [(&'static str, &'static str)] {
         ("global", "hdmi_system_audio_control_enabled"),
         ("secure", "match_content_frame_rate"),
         ("secure", "long_press_timeout"),
-        // Appended, never inserted: `current_settings_map` pairs these keys
-        // with `settings get` output lines positionally, so reordering would
-        // silently mis-assign every value after the change.
         ("global", "encoded_surround_output"),
         ("global", "encoded_surround_output_enabled_formats"),
     ]
@@ -56,6 +51,8 @@ pub struct Snapshot {
     /// Key format: `"<namespace>.<key>"` (e.g. `"global.window_animation_scale"`).
     /// Values are the raw strings the device returned.
     pub settings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub absent_settings: Vec<String>,
 }
 
 /// Errors that arise from snapshot parsing / application.
@@ -87,7 +84,24 @@ impl Snapshot {
                 supported: SCHEMA_VERSION,
             });
         }
-        serde_json::from_value(value).map_err(|e| SnapshotError::Malformed(e.to_string()))
+        let mut snapshot: Self =
+            serde_json::from_value(value).map_err(|e| SnapshotError::Malformed(e.to_string()))?;
+        if schema < 3 {
+            // Older captures omitted both absent and unreadable settings. Neither
+            // omission authorizes deleting a value on the target device.
+            snapshot.absent_settings.clear();
+            snapshot.schema_version = SCHEMA_VERSION;
+        }
+        if snapshot
+            .absent_settings
+            .iter()
+            .any(|key| snapshot.settings.contains_key(key))
+        {
+            return Err(SnapshotError::Malformed(
+                "setting cannot be both present and absent".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     pub fn to_json(&self) -> Result<String, SnapshotError> {
@@ -110,6 +124,7 @@ pub struct SnapshotApplyPlan {
     /// Settings whose current device value differs from the snapshot —
     /// these will be written. Same key format as `Snapshot::settings`.
     pub settings_to_write: BTreeMap<String, String>,
+    pub settings_to_delete: Vec<String>,
     /// Settings already at the snapshot's value on the device — no-op, counted
     /// so the preview doesn't overstate the work.
     pub settings_already_set: Vec<String>,
@@ -124,9 +139,8 @@ pub struct ApplyPlanInputs<'a> {
     pub target_device_type: DeviceType,
     pub currently_disabled: &'a [String],
     pub currently_installed: &'a [String],
-    /// Current device values for the snapshot's setting keys, so the plan can
-    /// skip settings already at the target value. Empty map = treat all as
-    /// needing a write (back-compat).
+    /// Successfully read current tracked values. Missing keys are absent;
+    /// callers must not substitute an empty map for a failed read.
     pub current_settings: &'a BTreeMap<String, String>,
 }
 
@@ -180,12 +194,22 @@ pub fn compute_apply_plan(snap: &Snapshot, inputs: &ApplyPlanInputs<'_>) -> Snap
         }
     }
 
+    let mut settings_to_delete = Vec::new();
+    for key in &snap.absent_settings {
+        if inputs.current_settings.contains_key(key) {
+            settings_to_delete.push(key.clone());
+        } else {
+            settings_already_set.push(key.clone());
+        }
+    }
+
     SnapshotApplyPlan {
         packages_to_disable: to_disable,
         packages_already_disabled: already_disabled,
         packages_not_installed: not_installed,
         launcher_to_set: snap.current_launcher.clone(),
         settings_to_write,
+        settings_to_delete,
         settings_already_set,
         cross_device_warning,
     }
@@ -213,6 +237,7 @@ mod tests {
             disabled_packages: vec!["com.foo".into(), "com.bar".into(), "com.missing".into()],
             current_launcher: Some("com.spocky.projengmenu".to_string()),
             settings,
+            absent_settings: Vec::new(),
         }
     }
 
@@ -253,6 +278,80 @@ mod tests {
     }
 
     #[test]
+    fn absent_and_empty_settings_roundtrip_and_plan_separately() {
+        let mut snap = sample_snapshot();
+        let empty_key = "global.encoded_surround_output_enabled_formats".to_string();
+        let absent_key = "global.encoded_surround_output".to_string();
+        snap.settings.insert(empty_key.clone(), String::new());
+        snap.absent_settings.push(absent_key.clone());
+        let parsed = Snapshot::from_json(&snap.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.settings.get(&empty_key), Some(&String::new()));
+        assert_eq!(parsed.absent_settings, std::slice::from_ref(&absent_key));
+        let current = BTreeMap::from([
+            (absent_key.clone(), "3".into()),
+            ("global.unrelated".into(), "keep".into()),
+        ]);
+        let plan = compute_apply_plan(
+            &parsed,
+            &ApplyPlanInputs {
+                target_device_type: DeviceType::Shield,
+                currently_disabled: &[],
+                currently_installed: &[],
+                current_settings: &current,
+            },
+        );
+        assert_eq!(plan.settings_to_delete, [absent_key]);
+        assert_eq!(plan.settings_to_write.get(&empty_key), Some(&String::new()));
+        assert!(!plan.settings_to_write.contains_key("global.unrelated"));
+        let absent = BTreeMap::new();
+        let unchanged = compute_apply_plan(
+            &parsed,
+            &ApplyPlanInputs {
+                target_device_type: DeviceType::Shield,
+                currently_disabled: &[],
+                currently_installed: &[],
+                current_settings: &absent,
+            },
+        );
+        assert!(unchanged.settings_to_delete.is_empty());
+        assert!(unchanged
+            .settings_already_set
+            .contains(&"global.encoded_surround_output".into()));
+    }
+
+    #[test]
+    fn legacy_omissions_never_become_deletions() {
+        for version in [1, 2] {
+            let mut snap = sample_snapshot();
+            snap.schema_version = version;
+            let mut json = serde_json::to_value(snap).unwrap();
+            json.as_object_mut().unwrap().remove("absent_settings");
+            let migrated = Snapshot::from_json(&json.to_string()).unwrap();
+            assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+            assert!(migrated.absent_settings.is_empty());
+            let current = BTreeMap::from([("global.encoded_surround_output".into(), "3".into())]);
+            let plan = compute_apply_plan(
+                &migrated,
+                &ApplyPlanInputs {
+                    target_device_type: DeviceType::Shield,
+                    currently_disabled: &[],
+                    currently_installed: &[],
+                    current_settings: &current,
+                },
+            );
+            assert!(plan.settings_to_delete.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_present_and_absent_values() {
+        let mut snap = sample_snapshot();
+        snap.absent_settings
+            .push("global.window_animation_scale".into());
+        assert!(Snapshot::from_json(&snap.to_json().unwrap()).is_err());
+    }
+
+    #[test]
     fn rejects_zero_schema_version() {
         let payload = r#"{
             "schema_version": 0,
@@ -270,7 +369,7 @@ mod tests {
             err,
             SnapshotError::UnsupportedSchema {
                 found: 0,
-                supported: 2
+                supported: 3
             }
         ));
     }
@@ -292,7 +391,7 @@ mod tests {
         match err {
             SnapshotError::UnsupportedSchema {
                 found: 999,
-                supported: 2,
+                supported: 3,
             } => {}
             other => panic!("wrong error: {other:?}"),
         }

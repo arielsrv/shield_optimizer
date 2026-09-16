@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use shield_optimizer_core::adb::driver::{BoundedShellOutput, ShellTermination};
 use shield_optimizer_core::adb::{AdbDriver, AdbError, AdbOutput, AdbResult};
 
 /// The standard subprocess-backed driver. Wraps `tokio::process::Command`.
@@ -109,6 +111,76 @@ impl SubprocessAdb {
 /// short enough that a genuinely hung adb still surfaces as an error.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+const SHELL_OUTPUT_LIMIT: usize = 256 * 1024;
+const SHELL_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn collect_bounded_shell(
+    mut cmd: Command,
+    duration: Duration,
+) -> AdbResult<BoundedShellOutput> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout configured as pipe");
+    let mut stderr = child.stderr.take().expect("stderr configured as pipe");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut out_buf = [0u8; 8192];
+    let mut err_buf = [0u8; 8192];
+    let mut out_eof = false;
+    let mut err_eof = false;
+    let mut status = None;
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+    let termination: std::io::Result<ShellTermination> = async {
+        loop {
+            if out_eof && err_eof && status.is_some() {
+                return Ok(ShellTermination::Completed);
+            }
+            tokio::select! {
+                _ = &mut deadline => return Ok(ShellTermination::Timeout),
+                result = child.wait(), if status.is_none() => status = Some(result?),
+                read = stdout.read(&mut out_buf), if !out_eof => {
+                    let count = read?;
+                    out_eof = count == 0;
+                    out.extend_from_slice(&out_buf[..count.min(SHELL_OUTPUT_LIMIT - out.len())]);
+                    if out.len() == SHELL_OUTPUT_LIMIT { return Ok(ShellTermination::OutputLimit); }
+                },
+                read = stderr.read(&mut err_buf), if !err_eof => {
+                    let count = read?;
+                    err_eof = count == 0;
+                    err.extend_from_slice(&err_buf[..count.min(SHELL_OUTPUT_LIMIT - err.len())]);
+                    if err.len() == SHELL_OUTPUT_LIMIT { return Ok(ShellTermination::OutputLimit); }
+                },
+            }
+        }
+    }
+    .await;
+    if status.is_none() {
+        child.start_kill()?;
+        status = Some(child.wait().await?);
+    }
+    Ok(BoundedShellOutput {
+        stdout: bounded_utf8(&out),
+        stderr: bounded_utf8(&err),
+        exit_code: status.and_then(|status| status.code()),
+        termination: termination?,
+    })
+}
+
+fn bounded_utf8(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut end = text.len().min(SHELL_OUTPUT_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
+}
+
 #[async_trait]
 impl AdbDriver for SubprocessAdb {
     async fn raw(&self, args: &[&str]) -> AdbResult<AdbOutput> {
@@ -121,6 +193,14 @@ impl AdbDriver for SubprocessAdb {
 
     async fn shell(&self, serial: &str, command: &str) -> AdbResult<AdbOutput> {
         self.run(&["-s", serial, "shell", command]).await
+    }
+
+    async fn shell_bounded(&self, serial: &str, command: &str) -> AdbResult<BoundedShellOutput> {
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(["-s", serial, "shell", command]);
+        super::hide_console_window(&mut cmd);
+        super::pin_working_directory(&mut cmd);
+        collect_bounded_shell(cmd, SHELL_TIMEOUT).await
     }
 
     async fn raw_bytes(&self, args: &[&str]) -> AdbResult<Vec<u8>> {
@@ -400,6 +480,69 @@ fn which_in_path(bin: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn shell_fixture(script: &str, duration: Duration) -> BoundedShellOutput {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        collect_bounded_shell(command, duration).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_preserves_nonzero_and_both_streams() {
+        let result = shell_fixture("printf out; printf err >&2; exit 7", SHELL_TIMEOUT).await;
+        assert_eq!(result.stdout, "out");
+        assert_eq!(result.stderr, "err");
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.termination, ShellTermination::Completed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_subprocess_nonzero_contract_is_unchanged() {
+        let driver = SubprocessAdb::new(PathBuf::from("/bin/sh"));
+        let result = driver.raw(&["-c", "printf failure >&2; exit 7"]).await;
+        assert!(
+            matches!(result, Err(AdbError::NonZeroExit { code: Some(7), stderr }) if stderr == "failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_stops_continuous_output() {
+        let result = shell_fixture(
+            "while :; do printf 0123456789; printf abcdefghij >&2; done",
+            SHELL_TIMEOUT,
+        )
+        .await;
+        assert_eq!(result.termination, ShellTermination::OutputLimit);
+        assert!(result.stdout.len() <= SHELL_OUTPUT_LIMIT);
+        assert!(result.stderr.len() <= SHELL_OUTPUT_LIMIT);
+        assert!(!result.stdout.is_empty());
+        assert!(!result.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_shell_deadline_keeps_partial_output() {
+        let result = shell_fixture(
+            "printf started; while :; do :; done",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result.termination, ShellTermination::Timeout);
+        assert_eq!(result.stdout, "started");
+    }
+
+    #[test]
+    fn bounded_utf8_handles_incomplete_and_invalid_characters() {
+        let text = format!("a{}", "€".repeat(SHELL_OUTPUT_LIMIT));
+        let output = bounded_utf8(&text.as_bytes()[..SHELL_OUTPUT_LIMIT - 1]);
+        assert!(output.len() <= SHELL_OUTPUT_LIMIT);
+        assert!(output.starts_with("a€"));
+        assert!(bounded_utf8(&vec![0xff; SHELL_OUTPUT_LIMIT]).len() <= SHELL_OUTPUT_LIMIT);
+    }
 
     #[test]
     fn discovery_does_not_search_path_after_valid_override() {

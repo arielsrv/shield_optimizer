@@ -20,28 +20,31 @@ use super::{is_valid_setting_key, quote_shell_arg, AppState};
 
 /// Read the device's current values for the tracked setting keys, keyed the
 /// same way snapshots store them (`"<ns>.<key>"`). Used so apply-plans can
-/// skip settings already at the target value. Best-effort — a failed read
-/// yields an empty map (everything treated as needing a write).
+/// skip settings already at the target value. Every read must complete before
+/// a missing value can be treated as absent.
 async fn current_settings_map(
     adb: &dyn crate::adb::AdbDriver,
     serial: &str,
-) -> std::collections::BTreeMap<String, String> {
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let keys = tracked_setting_keys();
-    let cmd = keys
+    let commands = keys
         .iter()
         .map(|(ns, key)| format!("settings get {ns} {key}"))
-        .collect::<Vec<_>>()
-        .join("; ");
+        .collect::<Vec<_>>();
+    let cmd = checked_batch_command(&commands.iter().map(String::as_str).collect::<Vec<_>>());
     let mut map = std::collections::BTreeMap::new();
-    if let Ok(out) = adb.shell(serial, &cmd).await {
-        for ((ns, key), raw) in keys.iter().zip(out.stdout.lines()) {
-            let v = raw.trim();
-            if !v.is_empty() && v != "null" {
-                map.insert(format!("{ns}.{key}"), v.to_string());
-            }
+    let out = adb
+        .shell(serial, &cmd)
+        .await
+        .map_err(|e| format!("read snapshot settings: {e}"))?;
+    let required = (0..keys.len()).collect::<Vec<_>>();
+    let sections = parse_checked_batch(&out.stdout, keys.len(), &required)?;
+    for ((ns, key), value) in keys.iter().zip(sections) {
+        if value != "null" {
+            map.insert(format!("{ns}.{key}"), value);
         }
     }
-    map
+    Ok(map)
 }
 
 /// Read the installed and disabled package lists in one round-trip. Both
@@ -157,7 +160,7 @@ pub async fn list_snapshots(state: State<'_, AppState>) -> Result<Vec<SnapshotFi
             device_serial: snap.device_serial,
             device_type: snap.device_type,
             disabled_count: snap.disabled_packages.len(),
-            settings_count: snap.settings.len(),
+            settings_count: snap.settings.len() + snap.absent_settings.len(),
             launcher: snap.current_launcher,
         });
     }
@@ -204,24 +207,12 @@ pub async fn save_snapshot(
         .and_then(|c| c.split_once('/'))
         .map(|(p, _)| p.to_string());
 
-    // Batch the `settings get` queries into one shell call. Output each
-    // value on its own line in declared order so we can match them up
-    // positionally. ~200ms total instead of ~200ms × 9.
-    let keys = tracked_setting_keys();
-    let cmd = keys
+    let settings = current_settings_map(adb.as_ref(), &serial).await?;
+    let absent_settings = tracked_setting_keys()
         .iter()
-        .map(|(ns, key)| format!("settings get {ns} {key}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut settings = std::collections::BTreeMap::new();
-    if let Ok(out) = adb.shell(&serial, &cmd).await {
-        for ((ns, key), raw) in keys.iter().zip(out.stdout.lines()) {
-            let v = raw.trim();
-            if !v.is_empty() && v != "null" {
-                settings.insert(format!("{ns}.{key}"), v.to_string());
-            }
-        }
-    }
+        .map(|(ns, key)| format!("{ns}.{key}"))
+        .filter(|key| !settings.contains_key(key))
+        .collect();
 
     // Detect device type the same way list_devices does — we'll just refetch
     // here for snapshot purposes since it's cheap.
@@ -250,6 +241,7 @@ pub async fn save_snapshot(
         disabled_packages,
         current_launcher,
         settings,
+        absent_settings,
     };
 
     // Write to disk.
@@ -290,7 +282,7 @@ pub async fn save_snapshot(
         device_serial: snap.device_serial,
         device_type: snap.device_type,
         disabled_count: snap.disabled_packages.len(),
-        settings_count: snap.settings.len(),
+        settings_count: snap.settings.len() + snap.absent_settings.len(),
         launcher: snap.current_launcher,
     })
 }
@@ -330,7 +322,7 @@ pub async fn preview_apply(
     let (installed_pkgs, disabled_pkgs) = installed_and_disabled(adb.as_ref(), &serial).await?;
 
     let device = crate::commands::devices::device_profile_impl(state.inner(), &serial).await?;
-    let current_settings = current_settings_map(adb.as_ref(), &serial).await;
+    let current_settings = current_settings_map(adb.as_ref(), &serial).await?;
 
     let plan = compute_apply_plan(
         &snap,
@@ -351,6 +343,7 @@ pub struct ApplyResult {
     pub launcher_set: bool,
     pub launcher_message: Option<String>,
     pub settings_written: Vec<String>,
+    pub settings_deleted: Vec<String>,
     pub settings_failed: Vec<String>,
     pub summary: String,
 }
@@ -417,7 +410,7 @@ pub async fn apply_snapshot(
     let (installed_pkgs, disabled_pkgs) = installed_and_disabled(adb.as_ref(), &serial).await?;
 
     let device = crate::commands::devices::device_profile_impl(state.inner(), &serial).await?;
-    let current_settings = current_settings_map(adb.as_ref(), &serial).await;
+    let current_settings = current_settings_map(adb.as_ref(), &serial).await?;
     let plan = compute_apply_plan(
         &snap,
         &ApplyPlanInputs {
@@ -461,14 +454,49 @@ pub async fn apply_snapshot(
         }
     }
 
-    // 3. Write tracked settings — batch into a single shell call.
+    let (settings_written, settings_deleted, settings_failed) =
+        apply_settings_from_plan(adb.as_ref(), &serial, &plan).await;
+
+    let summary = format!(
+        "Disabled {} packages ({} failed). Launcher: {}. {} settings written, {} reset ({} failed).",
+        packages_disabled.len(),
+        packages_failed.len(),
+        if launcher_set { "set" } else { "unchanged" },
+        settings_written.len(),
+        settings_deleted.len(),
+        settings_failed.len()
+    );
+
+    Ok(ApplyResult {
+        packages_disabled,
+        packages_failed,
+        launcher_set,
+        launcher_message,
+        settings_written,
+        settings_deleted,
+        settings_failed,
+        summary,
+    })
+}
+
+async fn apply_settings_from_plan(
+    adb: &dyn crate::adb::AdbDriver,
+    serial: &str,
+    plan: &SnapshotApplyPlan,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut settings_written = Vec::new();
+    let mut settings_deleted = Vec::new();
     let mut settings_failed = Vec::new();
     // Apply one setting per shell call. Batching with `;` meant a single failing
     // `settings put` (e.g. a SecurityException on a protected key) was invisible
     // — `adb shell` still exits 0, so the old code reported every key written.
     // Per-key lets us report exactly which succeeded, and check the output.
-    for (k, v) in &plan.settings_to_write {
+    let writes = plan
+        .settings_to_write
+        .iter()
+        .map(|(key, value)| (key, Some(value)));
+    let deletes = plan.settings_to_delete.iter().map(|key| (key, None));
+    for (k, value) in writes.chain(deletes) {
         // Key shape is `"ns.subkey"` per the snapshot schema.
         let Some((ns, key)) = k.split_once('.') else {
             settings_failed.push(format!("{k}: malformed key (expected ns.subkey)"));
@@ -484,39 +512,31 @@ pub async fn apply_snapshot(
         }
         // Single-quote the value so shell metacharacters inside it are inert;
         // legitimate content (numbers, spaces, device names) passes through.
-        let quoted_v = quote_shell_arg(v);
-        match adb
-            .shell(&serial, &format!("settings put {ns} {key} {quoted_v}"))
-            .await
-        {
-            Ok(out) if !out.shell_reported_failure() => settings_written.push(k.clone()),
+        let command = match value {
+            Some(value) => format!("settings put {ns} {key} {}", quote_shell_arg(value)),
+            None => format!("settings delete {ns} {key}"),
+        };
+        match adb.shell(serial, &command).await {
+            Ok(out) if !out.shell_reported_failure() => {
+                if value.is_some() {
+                    settings_written.push(k.clone());
+                } else {
+                    settings_deleted.push(k.clone());
+                }
+            }
             Ok(out) => settings_failed.push(format!("{k}: {}", out.combined().trim())),
             Err(e) => settings_failed.push(format!("{k}: {e}")),
         }
     }
 
-    let summary = format!(
-        "Disabled {} packages ({} failed). Launcher: {}. {} settings written.",
-        packages_disabled.len(),
-        packages_failed.len(),
-        if launcher_set { "set" } else { "unchanged" },
-        settings_written.len()
-    );
-
-    Ok(ApplyResult {
-        packages_disabled,
-        packages_failed,
-        launcher_set,
-        launcher_message,
-        settings_written,
-        settings_failed,
-        summary,
-    })
+    (settings_written, settings_deleted, settings_failed)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{current_settings_map, disable_from_plan, installed_and_disabled};
+    use super::{
+        apply_settings_from_plan, current_settings_map, disable_from_plan, installed_and_disabled,
+    };
     use crate::adb::BATCH_SEPARATOR;
     use crate::commands::test_support::MockAdb;
 
@@ -587,9 +607,13 @@ mod tests {
     async fn current_settings_map_pairs_keys_to_values_in_order() {
         // tracked_setting_keys order: window/transition/animator scale,
         // 4x hdmi, match_content_frame_rate, long_press_timeout.
-        let mock =
-            MockAdb::default().on_shell("settings get", "0.5\n0.5\n0.5\n1\nnull\n0\n1\n2\n400\n");
-        let map = current_settings_map(&mock, "serial").await;
+        let mock = MockAdb::default().on_shell(
+            "settings get",
+            &batched(&[
+                "0.5", "0.5", "0.5", "1", "null", "0", "1", "2", "400", "null", "",
+            ]),
+        );
+        let map = current_settings_map(&mock, "serial").await.unwrap();
         assert_eq!(
             map.get("global.window_animation_scale").map(String::as_str),
             Some("0.5")
@@ -610,6 +634,60 @@ mod tests {
         );
         // "null" line is dropped, not stored.
         assert!(!map.contains_key("global.hdmi_control_auto_wakeup_enabled"));
+        assert_eq!(
+            map.get("global.encoded_surround_output_enabled_formats")
+                .map(String::as_str),
+            Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_capture_rejects_failed_and_truncated_reads() {
+        let complete = batched(&vec!["null"; super::tracked_setting_keys().len()]);
+        let status = crate::adb::batch::BATCH_STATUS;
+        for output in [
+            complete.replacen(&format!("{status}0"), &format!("{status}1"), 1),
+            "null\n".into(),
+        ] {
+            let mock = MockAdb::default().on_shell("settings get", &output);
+            assert!(current_settings_map(&mock, "serial").await.is_err());
+        }
+        let mock = MockAdb::default().on_shell_err("settings get", "offline");
+        assert!(current_settings_map(&mock, "serial").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn setting_apply_distinguishes_empty_put_delete_and_failure() {
+        let plan = super::SnapshotApplyPlan {
+            packages_to_disable: vec![],
+            packages_already_disabled: vec![],
+            packages_not_installed: vec![],
+            launcher_to_set: None,
+            cross_device_warning: None,
+            settings_already_set: vec![],
+            settings_to_write: [("global.empty".into(), String::new())].into(),
+            settings_to_delete: vec![
+                "global.unset".into(),
+                "global.denied".into(),
+                "global.bad;key".into(),
+            ],
+        };
+        let mock = MockAdb::default()
+            .on_shell_failure("settings delete global denied", "Error: permission denied");
+        let log = mock.shell_log();
+        let (written, deleted, failed) = apply_settings_from_plan(&mock, "serial", &plan).await;
+        assert_eq!(written, ["global.empty"]);
+        assert_eq!(deleted, ["global.unset"]);
+        assert_eq!(failed.len(), 2);
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            *calls,
+            [
+                "settings put global empty ''",
+                "settings delete global unset",
+                "settings delete global denied"
+            ]
+        );
     }
 
     #[tokio::test]

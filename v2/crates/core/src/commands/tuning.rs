@@ -42,43 +42,50 @@ pub struct TweaksState {
 #[tauri::command]
 pub async fn get_tweaks(state: State<'_, AppState>, serial: String) -> Result<TweaksState, String> {
     let adb = state.adb_snapshot().await;
-    let cmd = "settings get global hdmi_control_enabled; \
-               settings get global hdmi_control_auto_wakeup_enabled; \
-               settings get global hdmi_control_auto_device_off_enabled; \
-               settings get global hdmi_system_audio_control_enabled; \
-               settings get secure match_content_frame_rate; \
-               settings get secure long_press_timeout; \
-               settings get global window_animation_scale; \
-               settings get global transition_animation_scale; \
-               settings get global animator_duration_scale; \
-               settings get global background_process_limit; \
-               settings get global encoded_surround_output; \
-               settings get global encoded_surround_output_enabled_formats";
+    get_tweaks_for(adb.as_ref(), &serial).await
+}
+
+async fn get_tweaks_for(
+    adb: &dyn crate::adb::AdbDriver,
+    serial: &str,
+) -> Result<TweaksState, String> {
+    let commands = [
+        "settings get global hdmi_control_enabled",
+        "settings get global hdmi_control_auto_wakeup_enabled",
+        "settings get global hdmi_control_auto_device_off_enabled",
+        "settings get global hdmi_system_audio_control_enabled",
+        "settings get secure match_content_frame_rate",
+        "settings get secure long_press_timeout",
+        "settings get global window_animation_scale",
+        "settings get global transition_animation_scale",
+        "settings get global animator_duration_scale",
+        "settings get global background_process_limit",
+        "settings get global encoded_surround_output",
+        "settings get global encoded_surround_output_enabled_formats",
+    ];
+    let cmd = crate::adb::checked_batch_command(&commands);
     let out = adb
-        .shell(&serial, cmd)
+        .shell(serial, &cmd)
         .await
         .map_err(|e| format!("settings get: {e}"))?;
-    let mut lines = out.stdout.lines().map(|s| {
-        let v = s.trim();
-        if v.is_empty() || v == "null" {
-            None
-        } else {
-            Some(v.to_string())
-        }
-    });
+    let required = (0..commands.len()).collect::<Vec<_>>();
+    let sections = crate::adb::parse_checked_batch(&out.stdout, commands.len(), &required)?;
+    let mut values = sections
+        .into_iter()
+        .map(|value| (value != "null").then_some(value));
     Ok(TweaksState {
-        hdmi_control_enabled: lines.next().flatten(),
-        hdmi_control_auto_wakeup_enabled: lines.next().flatten(),
-        hdmi_control_auto_device_off_enabled: lines.next().flatten(),
-        hdmi_system_audio_control_enabled: lines.next().flatten(),
-        match_content_frame_rate: lines.next().flatten(),
-        long_press_timeout: lines.next().flatten(),
-        window_animation_scale: lines.next().flatten(),
-        transition_animation_scale: lines.next().flatten(),
-        animator_duration_scale: lines.next().flatten(),
-        background_process_limit: lines.next().flatten(),
-        encoded_surround_output: lines.next().flatten(),
-        encoded_surround_output_enabled_formats: lines.next().flatten(),
+        hdmi_control_enabled: values.next().flatten(),
+        hdmi_control_auto_wakeup_enabled: values.next().flatten(),
+        hdmi_control_auto_device_off_enabled: values.next().flatten(),
+        hdmi_system_audio_control_enabled: values.next().flatten(),
+        match_content_frame_rate: values.next().flatten(),
+        long_press_timeout: values.next().flatten(),
+        window_animation_scale: values.next().flatten(),
+        transition_animation_scale: values.next().flatten(),
+        animator_duration_scale: values.next().flatten(),
+        background_process_limit: values.next().flatten(),
+        encoded_surround_output: values.next().flatten(),
+        encoded_surround_output_enabled_formats: values.next().flatten(),
     })
 }
 
@@ -404,7 +411,50 @@ pub async fn set_private_dns(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_setting_command, is_valid_dns_hostname};
+    use super::{build_setting_command, get_tweaks_for, is_valid_dns_hostname};
+    use crate::adb::{batch::BATCH_STATUS, BATCH_SEPARATOR};
+    use crate::commands::test_support::MockAdb;
+
+    fn settings_output(values: &[&str]) -> String {
+        values
+            .iter()
+            .map(|value| format!("{value}\n{BATCH_STATUS}0\n"))
+            .collect::<Vec<_>>()
+            .join(&format!("{BATCH_SEPARATOR}\n"))
+    }
+
+    #[tokio::test]
+    async fn tweaks_preserve_empty_values_without_shifting_audio_settings() {
+        let output = settings_output(&[
+            "", "1", "0", "1", "null", "400", "0.5", "1", "1", "null", "3", "5,6,99",
+        ]);
+        let adb = MockAdb::default().on_shell("settings get", &output);
+        let tweaks = get_tweaks_for(&adb, "serial").await.unwrap();
+        assert_eq!(tweaks.hdmi_control_enabled.as_deref(), Some(""));
+        assert_eq!(
+            tweaks.hdmi_control_auto_wakeup_enabled.as_deref(),
+            Some("1")
+        );
+        assert_eq!(tweaks.match_content_frame_rate, None);
+        assert_eq!(tweaks.encoded_surround_output.as_deref(), Some("3"));
+        assert_eq!(
+            tweaks.encoded_surround_output_enabled_formats.as_deref(),
+            Some("5,6,99")
+        );
+    }
+
+    #[tokio::test]
+    async fn tweaks_reject_failed_or_truncated_readback() {
+        let output = settings_output(&["null"; 12]);
+        let failed = output.replacen(&format!("{BATCH_STATUS}0"), &format!("{BATCH_STATUS}1"), 1);
+        let truncated = settings_output(&["null"; 11]);
+        for output in [failed, truncated, "null\n".into()] {
+            let adb = MockAdb::default().on_shell("settings get", &output);
+            assert!(get_tweaks_for(&adb, "serial").await.is_err());
+        }
+        let adb = MockAdb::default().on_shell_err("settings get", "device offline");
+        assert!(get_tweaks_for(&adb, "serial").await.is_err());
+    }
 
     #[test]
     fn accepts_real_dot_hostnames() {

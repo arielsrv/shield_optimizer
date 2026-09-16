@@ -2,8 +2,11 @@
   import { api } from "$lib/api";
   import { getShellBookmarks, setShellBookmarks, type ShellBookmark } from "$lib/prefs";
   import type { ShellRunResult } from "$lib/types";
+  import { onDestroy } from "svelte";
 
-  let { serial }: { serial: string } = $props();
+  let { serial, acknowledged = $bindable(false), onexecuted }: { serial: string; acknowledged?: boolean; onexecuted?: () => void } = $props();
+  let alive = true;
+  onDestroy(() => { alive = false; });
 
   let command = $state("");
   let running = $state(false);
@@ -12,9 +15,6 @@
   let bookmarks = $state<ShellBookmark[]>(getShellBookmarks());
   let bookmarkLabel = $state("");
 
-  /// Read-only starting points. Every one is an inspection rather than a
-  /// mutation, so a user exploring the tab cannot change device state by
-  /// clicking around.
   const PRESETS: ShellBookmark[] = [
     { label: "Disabled packages", command: "pm list packages -d" },
     { label: "Third-party packages", command: "pm list packages -3" },
@@ -25,19 +25,26 @@
     { label: "Uptime", command: "uptime" },
   ];
 
-  async function run(cmd: string = command) {
-    const trimmed = cmd.trim();
-    if (!trimmed || running) return;
+  async function run() {
+    const trimmed = command.trim();
+    if (!trimmed || running || !acknowledged) return;
+    const target = serial;
     command = trimmed;
     running = true;
     err = null;
     result = null;
     try {
-      result = await api.runShell(serial, trimmed);
+      const response = await api.runShell(target, trimmed);
+      if (!alive || serial !== target) return;
+      result = response;
+      if (!response.blocked) onexecuted?.();
     } catch (e) {
+      if (!alive || serial !== target) return;
       err = String(e);
+      // A lost connection can follow a partially executed mutation.
+      onexecuted?.();
     } finally {
-      running = false;
+      if (alive && serial === target) running = false;
     }
   }
 
@@ -71,16 +78,20 @@
 <div class="card" role="tabpanel" tabindex={0} id="tabpanel-shell" aria-labelledby="tab-shell">
   <div class="card-header">
     <h2>Shell</h2>
-    <button onclick={() => run()} disabled={running || !command.trim()}>
+    <button onclick={() => run()} disabled={!acknowledged || running || !command.trim()}>
       {running ? "Running…" : "Run"}
     </button>
   </div>
   <p class="muted small">
-    Runs on the device via <code>adb shell</code>. Commands that plainly disable or
-    remove a package on the do-not-disable list are refused before anything is sent —
-    enough to catch an accidental paste, not a substitute for knowing what a command
-    does.
+    Expert mode runs arbitrary commands via <code>adb shell</code> and can erase data
+    or make the device unusable. This is an exception to the app's protected-package
+    safeguards. A basic check catches some obvious dangerous commands, but shell
+    expressions can bypass it. Output is limited to 256 KiB per stream and execution
+    to 30 seconds; stopping local ADB does not guarantee remote work has stopped.
   </p>
+  <label class="small"><input type="checkbox" bind:checked={acknowledged} disabled={running} />
+    I understand these risks and want to enable expert shell for this device session.
+  </label>
 
   <textarea
     class="shell-input mono"
@@ -94,7 +105,7 @@
 
   <div class="presets">
     {#each PRESETS as p (p.label)}
-      <button class="small-action" disabled={running} onclick={() => run(p.command)}>
+      <button class="small-action" disabled={running} onclick={() => { command = p.command; }}>
         {p.label}
       </button>
     {/each}
@@ -116,7 +127,7 @@
     <div class="bookmarks">
       {#each bookmarks as b (b.label)}
         <div class="bookmark">
-          <button class="small-action" disabled={running} onclick={() => run(b.command)}>
+          <button class="small-action" disabled={running} onclick={() => { command = b.command; }}>
             {b.label}
           </button>
           <code class="bookmark-cmd">{b.command}</code>
@@ -136,6 +147,9 @@
     {#if result.blocked}
       <p class="blocked">{result.blocked_reason}</p>
     {:else}
+      {#if result.termination !== "completed"}
+        <p class="blocked">{result.termination === "timeout" ? "Stopped after 30 seconds." : "Stopped at the output limit."} Partial output is shown below. The command may already have changed the device.</p>
+      {/if}
       <h3>
         Output
         {#if result.exit_code !== null && result.exit_code !== 0}

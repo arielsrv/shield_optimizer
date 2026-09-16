@@ -31,7 +31,7 @@ Research notes: aTV Tools is a **phone/tablet companion app** (Android 8.1+/iOS 
 | Screen mirroring / gamepad / media remote | ✅ (phone-centric) | — (out of scope for desktop) |
 | Open source / free | ❌ | ✅ |
 
-**Playback capability report** (Media tab) has no aTV Tools counterpart — codec/HDR/display-mode/passthrough facts read off the device, plus a verdict that names what is costing quality.
+**Playback report** (Playback tab, unreleased) shows codec configuration, reported HDR/display modes, and audio policy. These observations do not establish runtime decoder support, acceleration, or playback quality.
 
 **Bottom line:** we beat aTV Tools on the *debloat/optimize/safety* core, they beat us on *general device utilities*. The gaps worth closing are the utilities that complement debloating; the phone-centric features aren't our product.
 
@@ -59,9 +59,9 @@ Shape: `adb -s X exec-out screencap -p > local.png`, save to a user folder, show
 
 **5. Force-stop** on memory-table rows (`am force-stop <pkg>`) — trivial, pairs with the existing Disable button.
 **6. Send text to TV** — `input text '<escaped>'` for typing Wi-Fi passwords/searches from the desktop keyboard. Small input box on the device header. (Escape carefully; relates to the package-validation work.)
-**7. Shell runner with bookmarks** — ✅ shipped as the Shell tab. Command input → driver → stdout/stderr, read-only presets, bookmarks in `localStorage`. `engine::safety::shell_command_blocked` refuses any command that would disable/uninstall a never-disable package *before* it reaches the device, so the free-form box cannot route around the safety list.
+**7. Shell runner with bookmarks** — implemented on the unreleased desktop Shell tab. Explicit expert acknowledgment → editor → Run → bounded stdout/stderr. Presets/bookmarks populate the editor only. The lexical gate catches obvious protected-package commands but can be bypassed by shell expressions; this is an explicit exception to curated-action safety. Mobile shell is deferred.
 **8. Bulk cache clear** — `pm trim-caches 999999999999` (one call, no per-app loop).
-**9. CPU + network monitor** — ✅ shipped as the `resource_sample` command: two `/proc/stat` + `/proc/net/dev` reads either side of a device-side `sleep 1`, in one round trip. Kept out of `health_report` so a refresh never pays the sampling second.
+**9. CPU + network monitor** — implemented by `resource_sample` on the unreleased desktop and mobile apps: two device-side samples with `/proc/uptime` elapsed time and per-interface network rates. Independent of the health report; mobile sampling is explicitly requested, not polled.
 
 ### P3 — Evaluate later
 **10. Screen recording** — `screenrecord` (3-min cap, no DRM), pull + save. Nice demo material.

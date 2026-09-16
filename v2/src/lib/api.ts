@@ -193,8 +193,8 @@ export const api = {
   rebootDevice: (serial: string, mode: RebootMode) =>
     invoke<RebootResult>("reboot_device", { serial, mode }),
 
-  mediaReport: (serial: string, deviceType: DeviceType) =>
-    invoke<MediaCapabilities>("media_report", { serial, deviceType }),
+  mediaReport: (serial: string) =>
+    invoke<MediaCapabilities>("media_report", { serial }),
   resourceSample: (serial: string) => invoke<ResourceSample>("resource_sample", { serial }),
   runShell: (serial: string, command: string) =>
     invoke<ShellRunResult>("run_shell", { serial, command }),
