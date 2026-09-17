@@ -304,6 +304,8 @@ const CAUTION: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn shell_runner_blocks_disabling_a_never_disable_package() {
         let (pkg, reason) =
@@ -411,8 +413,6 @@ mod tests {
             );
         }
     }
-
-    use super::*;
 
     #[test]
     fn framework_is_never_disable() {

@@ -19,18 +19,49 @@ When you add a new section, put it at the top; older releases go below.
 
 ## v2-2.2.0-beta.1
 
-### Playback and expert diagnostics
+Four reported bugs reach users for the first time, plus a Playback tab, an
+expert shell, and a companion-app overhaul. Three of those fixes were written
+without the reporter's hardware in hand — if you filed one of them, please say
+whether this build works for you.
 
-- Desktop and mobile report advertised video decoders, display modes, HDR formats, and audio policy without treating configuration files as proof of runtime playback support.
-- CPU and per-interface network samples use the device's measured sampling interval. Mobile sampling is on demand.
-- Audio passthrough controls preserve unknown format codes and serialize changes through readback. Mobile reads remain Free and writes require Pro.
-- Desktop expert shell requires explicit acknowledgment, bounds output and execution time, and retains nonzero exit status and partial output. Presets and bookmarks only fill the editor. Arbitrary shell is an explicit exception to protected-package guarantees; mobile shell is not exposed.
-- New snapshots record absent settings separately from empty values so restoring device defaults is reversible. Older snapshots preserve their original omission-as-no-op behavior.
+### Playback
 
-Four reported bugs reach users for the first time, plus safer defaults and a
-companion-app overhaul. Three of these fixes were written without the
-reporter's hardware in hand — if you filed one of them, please say whether this
-build works for you.
+- **A new Playback tab** reports what the TV says it can do: which video
+  decoders it advertises, which display modes and HDR formats it lists, and
+  what its audio passthrough settings are set to. It reads configuration, and
+  it says so — an entry here is not proof that a codec is registered at
+  runtime, hardware-accelerated, or good enough to play a given file.
+- **Tweaks gained an Audio Passthrough control** — Auto / Never / Always /
+  Manual, with the per-format allow-list when Manual is selected. A format code
+  the app doesn't have a name for is kept rather than quietly dropped from the
+  device's list, one change is written at a time, and every row is re-read from
+  the device afterwards, so what you see is what the TV reports, not what was
+  asked for.
+- The Health tab now samples CPU load and per-interface network throughput.
+  Rates are computed from the device's own clock over the sampling window, so
+  a slow round-trip doesn't inflate them. The companion app samples on demand
+  rather than polling; reads stay Free and writes need Pro.
+
+### Expert shell
+
+- **A Shell tab for everything the curated screens don't cover**, off until you
+  turn it on and acknowledge what it is. Output and runtime are bounded (256 KiB
+  per stream, 30 seconds), a non-zero exit and whatever output arrived first are
+  both kept, and presets and bookmarks only fill the editor — nothing runs until
+  you press Run.
+- It refuses the obvious ways to break a TV from a pasted command, but that
+  check is an anti-footgun, not a guarantee: a shell expression can get around
+  it. This is the one place in the app where the do-not-disable list is not
+  enforced, and it says so on screen. The companion app does not have it.
+
+### Snapshots
+
+- **A setting that was never set is now restored as never set.** Snapshots used
+  to record "unset" and "empty" the same way, so restoring one could not put a
+  setting back to the device's own default. New snapshots record the difference
+  and the preview shows what will be reset. Snapshots taken by earlier versions
+  behave exactly as they did before — an omission in an old file still means
+  "leave it alone", never "delete it".
 
 ### Devices and pairing
 

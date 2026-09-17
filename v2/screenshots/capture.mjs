@@ -79,55 +79,55 @@ async function captureScreens(page, shot) {
     await page.getByText("3840x2160", { exact: false }).first().waitFor();
     await shot("health");
 
-    // 4. Playback capabilities.
+    // 5. Playback capabilities.
     await page.locator("#tab-media").click();
     await page.getByRole("heading", { name: "Video codec configuration" }).waitFor();
     await shot("playback");
 
-    // 5. Launcher.
+    // 6. Launcher.
     await page.locator("#tab-launcher").click();
     await page.getByText("Projectivy Launcher", { exact: false }).first().waitFor();
     await shot("launcher");
 
-    // 6. App list.
+    // 7. App list.
     await page.locator("#tab-apps").click();
     await page.getByText("App List", { exact: false }).first().waitFor();
     await page.waitForTimeout(400);
     await shot("app-list");
 
-    // 7. Optimize wizard — needs a click to load the plan.
+    // 8. Optimize wizard — needs a click to load the plan.
     await page.locator("#tab-optimize").click();
     await page.getByRole("button", { name: "Optimize", exact: true }).click();
     await page.getByText("Run", { exact: false }).first().waitFor().catch(() => {});
     await page.waitForTimeout(600);
     await shot("optimize");
 
-    // 8. Tweaks.
+    // 9. Tweaks.
     await page.locator("#tab-tweaks").click();
     await page.getByText("HDMI", { exact: false }).first().waitFor();
     await shot("tweaks");
 
-    // 9. Remote.
+    // 10. Remote.
     await page.locator("#tab-remote").click();
     await page.getByText("Live typing", { exact: false }).first().waitFor();
     await shot("remote");
 
-    // 10. Files.
+    // 11. Files.
     await page.locator("#tab-files").click();
     await page.getByText("Download", { exact: true }).first().waitFor();
     await shot("files");
 
-    // 11. Install APK.
+    // 12. Install APK.
     await page.locator("#tab-sideload").click();
     await page.getByText("Install APK", { exact: false }).first().waitFor();
     await shot("install-apk");
 
-    // 12. Snapshot (per-device).
+    // 13. Snapshot (per-device).
     await page.locator("#tab-snapshot").click();
     await page.waitForTimeout(400);
     await shot("snapshot");
 
-    // 13. Shell runner.
+    // 14. Shell runner.
     await page.locator("#tab-shell").click();
     await page.getByText("Disabled packages", { exact: false }).first().waitFor();
     await shot("shell");
