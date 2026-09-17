@@ -25,7 +25,7 @@ Verify with `cd <archive> && shasum -a 256 -c MANIFEST-sha256.txt`.
   screenshots and applied patches.
 
 Both are heavy with internal process vocabulary from the retired tracker. The durable, readable
-versions of this material are already in the repo: [`GASTOWN-HANDOFF.md`](GASTOWN-HANDOFF.md),
+versions of this material are already in the repo:
 [`RELEASE-DECISION-2026-09-09.md`](RELEASE-DECISION-2026-09-09.md),
 [`gastown-shield_optimizer-beads-export.json`](gastown-shield_optimizer-beads-export.json) and
 [`../v2/mobile/evidence/`](../v2/mobile/evidence/).

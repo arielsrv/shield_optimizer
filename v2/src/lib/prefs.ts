@@ -61,3 +61,19 @@ export function setShellBookmarks(bookmarks: ShellBookmark[]): void {
     localStorage.setItem(SHELL_BOOKMARKS_KEY, JSON.stringify(bookmarks));
   }
 }
+
+const LAST_SEEN_VERSION_KEY = "shieldopt.lastSeenVersion";
+
+/// Version this machine last had a look at. Used to notice that an update
+/// landed since the last launch, which is the only way someone with
+/// auto-update on ever finds out what changed.
+export function getLastSeenVersion(): string | null {
+  if (typeof localStorage === "undefined") return null;
+  return localStorage.getItem(LAST_SEEN_VERSION_KEY);
+}
+
+export function setLastSeenVersion(version: string): void {
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem(LAST_SEEN_VERSION_KEY, version);
+  }
+}

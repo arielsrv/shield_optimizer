@@ -15,9 +15,6 @@ Before touching v2, skim `v2/HANDOFF.md` — it carries the current roadmap, the
   in `bryanroscoe/shield_optimizer`. Each is titled `[<id>] <title>` and carries the original
   description, acceptance criteria and dependencies. Issues without that label are user reports;
   some of them duplicate a labeled issue (`#88`, `#89`, `#91` are the known pairs).
-- **[`docs/GASTOWN-HANDOFF.md`](docs/GASTOWN-HANDOFF.md) is the orientation document.** Read it
-  before picking anything up: it explains what the two products are, exactly where the release
-  stands, and what to work on first.
 - **[`docs/RELEASE-DECISION-2026-09-09.md`](docs/RELEASE-DECISION-2026-09-09.md)** has the release
   plan and the step-by-step physical device test script. Read it before tagging anything.
 - **[`docs/gastown-shield_optimizer-beads-export.json`](docs/gastown-shield_optimizer-beads-export.json)**
@@ -26,14 +23,23 @@ Before touching v2, skim `v2/HANDOFF.md` — it carries the current roadmap, the
 - **[`docs/ARCHIVE-INDEX.md`](docs/ARCHIVE-INDEX.md)** points at bulk working material kept outside
   this repo on Bryan's machine.
 
-### What is in flight right now (2026-09-12)
+### What is in flight right now (2026-09-16)
 
-Everything on `main` past the `v2-2.1.0` tag is **unreleased and has never run on a physical
-device.** Local gates pass on one macOS host; Linux, Windows and device runs have not happened.
-Four user-reported fixes (#86, #87, #88, #89) are sitting on `main` and have not reached a user.
-**Running the device test and shipping the beta is the highest-value work available.** Three of
-those four fixes were written without reproducing the reporter's hardware, so treat them as
-unconfirmed until a reporter confirms.
+Everything on `main` past the `v2-2.1.0` tag is **unreleased**, and most of it has never run on a
+physical device. CI is green across ubuntu / macOS / Windows plus both frontends, so "green on one
+macOS host" is no longer the gap — the device run is.
+
+All five user reports are addressed on `main` and none has shipped: #86 SmartTube backups, #87
+Sony launcher, #88 TCL discovery, #89 macOS volume prompts, #91 Remote paste. Only #91 has been
+seen working by anyone. **#87, #88 and #89 were fixed without the reporter's hardware** — the
+reasoning is recorded on each issue, and all four reporters have been asked to confirm. Treat them
+as unconfirmed until they do.
+
+The remaining gate before a beta is the device script in
+[`docs/RELEASE-DECISION-2026-09-09.md`](docs/RELEASE-DECISION-2026-09-09.md); steps D1 and D8 are
+the only real proof for #89, since that fix concerns the working directory the app inherits when
+launched from a mounted DMG. `v2/CHANGELOG.md` already has the `v2-2.2.0-beta.1` section the
+release workflow will read.
 
 The mobile companion app (`v2/mobile/`) has its own authoritative handoff at
 [`v2/mobile/HANDOFF.md`](v2/mobile/HANDOFF.md). Its safety story depends on never claiming more

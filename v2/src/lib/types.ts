@@ -276,6 +276,9 @@ export interface UpdateInfo {
   latest: string | null;
   update_available: boolean;
   url: string;
+  /// Notes for the version currently running — shown once after an update
+  /// lands, including one installed by Homebrew or by hand.
+  current_notes: string | null;
 }
 
 export interface InstallResult {

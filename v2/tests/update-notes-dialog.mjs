@@ -160,6 +160,69 @@ async function exercise({ browser, base }) {
   );
 }
 
+/// Someone with auto-update on never sees the pre-install notes: the update
+/// downloads, installs and relaunches without them ever pressing anything. The
+/// first launch on the new version is the only moment they can be told.
+///
+/// Driven entirely through the remembered version, because that is the only
+/// thing the feature actually keys off.
+async function exerciseArrived({ browser, base }) {
+  const stub = (body) => ({ status: 200, contentType: "application/javascript", body });
+  const newPage = async (lastSeen) => {
+    const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
+    // No update pending: this is the path after one has already installed.
+    await page.route(/plugin-updater/, (r) =>
+      r.fulfill(stub(`export async function check() { return null; }`)),
+    );
+    await page.route(/plugin-opener/, (r) =>
+      r.fulfill(stub(`export async function openUrl() {}`)),
+    );
+    await page.route(/plugin-process/, (r) =>
+      r.fulfill(stub(`export async function relaunch() {}`)),
+    );
+    await page.addInitScript((seen) => {
+      localStorage.clear();
+      if (seen) localStorage.setItem("shieldopt.lastSeenVersion", seen);
+    }, lastSeen);
+    await page.goto(base, { waitUntil: "networkidle" });
+    return page;
+  };
+
+  // Last launch was on an older version, so one landed in between.
+  const updated = await newPage("2.0.0");
+  const dialog = updated.getByRole("dialog");
+  await dialog.waitFor();
+  const body = await dialog.innerText();
+  assert.match(body, /Updated to v/, body);
+  assert.match(body, /Reliable switch away from the stock launcher/, body);
+  // Nothing to install — this is a notification, not a prompt.
+  assert.equal(await dialog.getByRole("button", { name: /^Install/ }).count(), 0);
+  await dialog.getByRole("button", { name: "Got it" }).click();
+  assert.equal(await updated.getByRole("dialog").count(), 0);
+  await updated.close();
+
+  // Same version as last launch: nothing happened, say nothing.
+  const same = await newPage("2.1.0");
+  await same.waitForTimeout(300);
+  assert.equal(
+    await same.getByRole("dialog").count(),
+    0,
+    "no update landed, so there is nothing to announce",
+  );
+  await same.close();
+
+  // A first run has nothing to compare against; greeting a new user with
+  // "what's new" would be nonsense.
+  const fresh = await newPage(null);
+  await fresh.waitForTimeout(300);
+  assert.equal(await fresh.getByRole("dialog").count(), 0, "a first run shows nothing");
+  await fresh.close();
+
+  console.log(
+    "Arrival notice passed: shown when a new version has landed, and not on a first run or an unchanged one.",
+  );
+}
+
 async function main() {
   const restore = setHarnessEnvironment();
   let server, browser;
@@ -170,6 +233,7 @@ async function main() {
     await server.listen();
     browser = await chromium.launch();
     await exercise({ browser, base: serverURL(server) });
+    await exerciseArrived({ browser, base: serverURL(server) });
   } finally {
     await browser?.close().catch((e) => console.error("browser cleanup failed", e));
     await server?.close().catch((e) => console.error("Vite cleanup failed", e));

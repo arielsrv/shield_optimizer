@@ -5,7 +5,12 @@
   import { check, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import { getThemePref, setThemePref, type ThemePref } from "$lib/theme";
-  import { getAutoUpdate, setAutoUpdate } from "$lib/prefs";
+  import {
+    getAutoUpdate,
+    getLastSeenVersion,
+    setAutoUpdate,
+    setLastSeenVersion,
+  } from "$lib/prefs";
   import { api } from "$lib/api";
   import { parseReleaseNotes, type NoteBlock } from "$lib/release-notes";
   import type { UpdateInfo } from "$lib/types";
@@ -31,6 +36,14 @@
   /// two can disagree — showing one version's number above another's notes
   /// would be worse than showing neither.
   const pendingVersion = $derived(pendingUpdate?.version ?? update?.latest ?? "");
+  /// Set when this launch is the first on a newly-installed version. Someone
+  /// with auto-update on never sees the pre-install notes, so this is the only
+  /// point at which they learn what changed. Also covers an upgrade done
+  /// outside the app, via Homebrew or by replacing it by hand.
+  let arrivedOn = $state<string | null>(null);
+  const arrivedNotes = $derived<NoteBlock[]>(
+    update?.current_notes ? parseReleaseNotes(update.current_notes) : [],
+  );
 
   onMount(() => {
     theme = getThemePref();
@@ -38,7 +51,17 @@
 
     api
       .checkForUpdate()
-      .then((u) => (update = u))
+      .then((u) => {
+        update = u;
+        const lastSeen = getLastSeenVersion();
+        // A first run has nothing to compare against, and greeting a new user
+        // with "what's new" makes no sense — record the version and say
+        // nothing. Notes can also be absent for a dev build or while offline.
+        if (lastSeen && lastSeen !== u.current && u.current_notes) {
+          arrivedOn = u.current;
+        }
+        setLastSeenVersion(u.current);
+      })
       .catch(() => {});
 
     checkForUpdate();
@@ -90,6 +113,10 @@
 
   function openNotes() {
     notesOpen = true;
+  }
+
+  function dismissArrived() {
+    arrivedOn = null;
   }
 
   async function installFromNotes() {
@@ -183,27 +210,38 @@
   </footer>
 </div>
 
-{#if notesOpen && update}
+{#if (notesOpen || arrivedOn) && update}
+  {@const arrived = arrivedOn !== null && !notesOpen}
+  {@const blocks = arrived ? arrivedNotes : releaseNotes}
   <!-- Blocks come from `parseReleaseNotes`, which returns data rather than
        markup. Everything below is rendered through the template, so remote
        text cannot become HTML. -->
-  <div class="notes-backdrop" role="presentation" onclick={() => (notesOpen = false)}></div>
+  <div
+    class="notes-backdrop"
+    role="presentation"
+    onclick={() => (arrived ? dismissArrived() : (notesOpen = false))}
+  ></div>
   <div class="notes-dialog" role="dialog" aria-modal="true" aria-labelledby="notes-title">
-    <h2 id="notes-title">What's new in v{pendingVersion}</h2>
-    <p class="notes-current muted">You're on v{update.current}.</p>
+    {#if arrived}
+      <h2 id="notes-title">Updated to v{update.current}</h2>
+      <p class="notes-current muted">Here's what changed.</p>
+    {:else}
+      <h2 id="notes-title">What's new in v{pendingVersion}</h2>
+      <p class="notes-current muted">You're on v{update.current}.</p>
+    {/if}
     <div class="notes-body">
-      {#if releaseNotes.length === 0}
+      {#if blocks.length === 0}
         <p class="muted">
           This release didn't come with notes. The release history on GitHub has
           the details.
         </p>
       {:else}
-        {#each releaseNotes as block, i (i)}
+        {#each blocks as block, i (i)}
           {#if block.kind === "heading"}
             <h3>{#each block.spans as span}{span.text}{/each}</h3>
-          {:else if block.kind === "item"}
-            <p class="notes-item">
-              <span class="notes-bullet">•</span>
+          {:else}
+            <p class:notes-item={block.kind === "item"}>
+              {#if block.kind === "item"}<span class="notes-bullet">•</span>{/if}
               <span>
                 {#each block.spans as span}
                   {#if span.href}
@@ -214,16 +252,6 @@
                 {/each}
               </span>
             </p>
-          {:else}
-            <p>
-              {#each block.spans as span}
-                {#if span.href}
-                  <button class="notes-link" onclick={() => openUrl(span.href!)}>{span.text}</button>
-                {:else if span.bold}<strong>{span.text}</strong>
-                {:else if span.code}<code>{span.text}</code>
-                {:else}{span.text}{/if}
-              {/each}
-            </p>
           {/if}
         {/each}
       {/if}
@@ -233,8 +261,12 @@
         All releases ↗
       </button>
       <span class="spacer"></span>
-      <button onclick={() => (notesOpen = false)}>Not now</button>
-      <button class="primary" onclick={installFromNotes}>Install v{pendingVersion}</button>
+      {#if arrived}
+        <button class="primary" onclick={dismissArrived}>Got it</button>
+      {:else}
+        <button onclick={() => (notesOpen = false)}>Not now</button>
+        <button class="primary" onclick={installFromNotes}>Install v{pendingVersion}</button>
+      {/if}
     </div>
   </div>
 {/if}

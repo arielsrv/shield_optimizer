@@ -19,7 +19,6 @@ Every issue is titled `[bead-id] title`, so references to old bead ids such as
 `ac-mlg.4` or `nv-sus` still resolve by searching the issue list. Each repository
 also holds, under `docs/`:
 
-- `GASTOWN-HANDOFF.md`, orienting a fresh agent with no Gas Town context.
 - `gastown-*-beads-export.json`, the complete tracker export including closed
   items, with full descriptions, acceptance criteria and comment history. This is
   the authoritative record where an issue body was trimmed for length.

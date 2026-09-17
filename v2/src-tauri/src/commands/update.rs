@@ -16,6 +16,12 @@ pub struct UpdateInfo {
     pub latest: Option<String>,
     pub update_available: bool,
     pub url: String,
+    /// Notes for the version *currently running*, so the app can show what a
+    /// user just received after an update installed itself. Distinct from the
+    /// pending update's notes, which describe a version not yet installed.
+    /// `None` when this build has no matching published release (a dev build)
+    /// or GitHub could not be reached.
+    pub current_notes: Option<String>,
 }
 
 /// `check_for_update` — fetch the latest non-draft `v2-*` release tag from
@@ -26,23 +32,36 @@ pub struct UpdateInfo {
 pub async fn check_for_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
-    let latest = fetch_latest_v2_tag().await.unwrap_or(None);
-    let update_available = latest
+    let found = fetch_releases(&current).await.unwrap_or_default();
+    let update_available = found
+        .latest
         .as_deref()
         .map(|l| is_newer(l, &current))
         .unwrap_or(false);
 
     Ok(UpdateInfo {
         current,
-        latest,
+        latest: found.latest,
         update_available,
         url: RELEASES_PAGE.to_string(),
+        current_notes: found.current_notes,
     })
 }
 
-/// GET the releases list and return the highest `v2-<semver>` tag's version
-/// string (the part after `v2-`). Skips drafts.
-async fn fetch_latest_v2_tag() -> Result<Option<String>, String> {
+#[derive(Default)]
+struct ReleaseLookup {
+    /// Highest published `v2-*` version.
+    latest: Option<String>,
+    /// Body of the release matching the running version.
+    current_notes: Option<String>,
+}
+
+/// GET the releases list once and pull two things out of it: the highest
+/// published `v2-<semver>` version, and the notes for the version running
+/// right now. One request serves both — the notes are wanted on every launch
+/// after an update, including one installed by Homebrew or by replacing the
+/// app by hand, neither of which goes through the in-app updater.
+async fn fetch_releases(current: &str) -> Result<ReleaseLookup, String> {
     let client = reqwest::Client::builder()
         .user_agent("shield-optimizer-update-check")
         .timeout(std::time::Duration::from_secs(10))
@@ -63,7 +82,13 @@ async fn fetch_latest_v2_tag() -> Result<Option<String>, String> {
     let releases: Vec<serde_json::Value> =
         serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
-    let mut best: Option<String> = None;
+    Ok(pick_releases(&releases, current))
+}
+
+/// Pure: choose the newest published version and the running version's notes.
+/// Split out so the selection is testable without a network round trip.
+fn pick_releases(releases: &[serde_json::Value], current: &str) -> ReleaseLookup {
+    let mut found = ReleaseLookup::default();
     for r in releases {
         if r.get("draft").and_then(|d| d.as_bool()).unwrap_or(false) {
             continue;
@@ -74,11 +99,24 @@ async fn fetch_latest_v2_tag() -> Result<Option<String>, String> {
         let Some(ver) = tag.strip_prefix("v2-") else {
             continue;
         };
-        if best.as_deref().map(|b| is_newer(ver, b)).unwrap_or(true) {
-            best = Some(ver.to_string());
+        if ver == current {
+            found.current_notes = r
+                .get("body")
+                .and_then(|b| b.as_str())
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
+        }
+        if found
+            .latest
+            .as_deref()
+            .map(|b| is_newer(ver, b))
+            .unwrap_or(true)
+        {
+            found.latest = Some(ver.to_string());
         }
     }
-    Ok(best)
+    found
 }
 
 /// Is version `a` newer than version `b`? Compares `MAJOR.MINOR.PATCH` first;
@@ -154,6 +192,72 @@ fn cmp_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release(tag: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({ "tag_name": tag, "body": body, "draft": false })
+    }
+
+    #[test]
+    fn finds_the_notes_for_the_version_actually_running() {
+        // After an update installs, the user is running a version we have
+        // notes for -- that is what "what's new" shows.
+        let releases = vec![
+            release("v2-2.2.0", "Newer notes"),
+            release("v2-2.1.0", "Notes for the running build"),
+            release("v2-2.0.0", "Older notes"),
+        ];
+
+        let found = pick_releases(&releases, "2.1.0");
+
+        assert_eq!(found.latest.as_deref(), Some("2.2.0"));
+        assert_eq!(
+            found.current_notes.as_deref(),
+            Some("Notes for the running build")
+        );
+    }
+
+    #[test]
+    fn a_build_with_no_published_release_has_no_notes() {
+        // A dev build, or one built from an unreleased commit. Showing another
+        // version's notes would be worse than showing none.
+        let found = pick_releases(&[release("v2-2.1.0", "Notes")], "2.2.0-dev");
+
+        assert_eq!(found.current_notes, None);
+        assert_eq!(found.latest.as_deref(), Some("2.1.0"));
+    }
+
+    #[test]
+    fn an_empty_release_body_is_not_notes() {
+        let found = pick_releases(&[release("v2-2.1.0", "   \n  ")], "2.1.0");
+
+        assert_eq!(found.current_notes, None);
+    }
+
+    #[test]
+    fn drafts_are_ignored_for_both_answers() {
+        let mut draft = release("v2-9.9.9", "Unpublished");
+        draft["draft"] = serde_json::Value::Bool(true);
+        let releases = vec![draft, release("v2-2.1.0", "Real notes")];
+
+        let found = pick_releases(&releases, "9.9.9");
+
+        assert_eq!(found.latest.as_deref(), Some("2.1.0"));
+        assert_eq!(found.current_notes, None, "a draft must not supply notes");
+    }
+
+    #[test]
+    fn non_v2_tags_are_skipped() {
+        // v1 PowerShell releases share this repo and use bare v0.x tags.
+        let releases = vec![
+            release("v0.9.1", "v1 notes"),
+            release("v2-2.1.0", "v2 notes"),
+        ];
+
+        let found = pick_releases(&releases, "2.1.0");
+
+        assert_eq!(found.latest.as_deref(), Some("2.1.0"));
+        assert_eq!(found.current_notes.as_deref(), Some("v2 notes"));
+    }
 
     #[test]
     fn newer_patch_and_minor() {

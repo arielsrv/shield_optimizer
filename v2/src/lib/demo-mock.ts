@@ -300,6 +300,13 @@ function handle(cmd: string, args: Record<string, unknown>): unknown {
         latest: pkg.version,
         update_available: false,
         url: "https://github.com/bryanroscoe/shield_optimizer/releases",
+        // The demo layer stands in for a real release, notes included, so the
+        // post-update "what's new" path is reachable without a GitHub call.
+        current_notes:
+          "Launcher switching is now fast and reliable.\n\n" +
+          "### Launchers\n\n" +
+          "- **Reliable switch away from the stock launcher.**\n" +
+          "- It opens the new launcher on the TV the moment the switch succeeds.",
       };
     case "list_devices":
       return [device];
