@@ -15,6 +15,7 @@
     "test:device-list-rows": "node tests/device-list-rows.mjs",
     "test:release-notes": "node tests/release-notes.mjs",
     "test:update-notes-dialog": "node tests/update-notes-dialog.mjs",
+    "test:remote-paste": "node tests/remote-paste.mjs",
     "test:playback-shell": "node tests/playback-shell.mjs",
     "screenshots": "node screenshots/capture.mjs && bash screenshots/build-gif.sh",
     "tauri": "tauri"

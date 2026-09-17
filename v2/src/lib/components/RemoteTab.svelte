@@ -64,6 +64,65 @@
     });
   }
 
+  /// Send pasted text as whole lines rather than synthesised keystrokes.
+  ///
+  /// One `input text` per line is a single round trip instead of one per
+  /// character, which matters most for exactly what this was asked for: long
+  /// URLs, usernames and passwords that are miserable to type on a remote
+  /// (GitHub #91).
+  ///
+  /// Newlines become explicit Enter presses, in order, because `input text`
+  /// cannot carry them — sending them literally would silently drop them and
+  /// paste something different from what was on the clipboard.
+  function sendPastedText(raw: string) {
+    const text = raw.replace(/\r\n?/g, "\n");
+    if (!text) return;
+    remoteFlushBuffer();
+    const lines = text.split("\n");
+    lines.forEach((line, i) => {
+      if (line) {
+        remoteEnqueue(async () => {
+          const r = await api.sendText(serial, line, forceShell);
+          noteTransport(r.transport);
+          if (!r.ok) remoteMessage = r.message;
+        });
+      }
+      if (i < lines.length - 1) sendRemoteKey("enter");
+    });
+    // Echo shows a newline as a return glyph so a multi-line paste is legible.
+    remoteEcho = (remoteEcho + text.replace(/\n/g, "\u23ce")).slice(-60);
+  }
+
+  /// The capture is a non-editable div, but a focused one still receives paste
+  /// with `clipboardData` populated — verified in both Chromium and WebKit,
+  /// the latter being what Tauri uses on macOS. No clipboard permission and no
+  /// plugin needed for this path.
+  function remotePaste(event: ClipboardEvent) {
+    event.preventDefault();
+    const text = event.clipboardData?.getData("text") ?? "";
+    if (!text) return;
+    remoteMessage = "";
+    sendPastedText(text);
+  }
+
+  /// The button exists because a dashed box that silently accepts Cmd+V is not
+  /// something anyone would guess at. Reading the clipboard directly can be
+  /// refused, so say what to do instead rather than failing silently.
+  async function pasteFromClipboard() {
+    remoteMessage = "";
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) {
+        remoteMessage = "Clipboard is empty.";
+        return;
+      }
+      sendPastedText(text);
+    } catch {
+      remoteMessage =
+        "Couldn't read the clipboard. Click the typing box, then press \u2318V / Ctrl+V.";
+    }
+  }
+
   // Settings opens via an intent (am start), not a keycode — the Shield's gear
   // button is an intent launch, and KEYCODE_SETTINGS/MENU no-op when injected.
   function openSettings() {
@@ -146,18 +205,25 @@
   </div>
   <div class="remote-layout">
     <div class="remote-typing">
-      <h3>Live typing</h3>
+      <div class="typing-header">
+        <h3>Live typing</h3>
+        <button class="small-action" onclick={pasteFromClipboard} title="Send the clipboard to the TV">
+          Paste
+        </button>
+      </div>
       <p class="muted small">
         Click below and type — keystrokes go straight to whatever field has
-        focus on the TV, including Backspace and Enter.
+        focus on the TV, including Backspace and Enter. You can paste too
+        (⌘V / Ctrl+V), which is easier for a long URL or password.
       </p>
       <div
         class="type-capture"
         class:focused={remoteCaptureFocused}
         tabindex="0"
         role="textbox"
-        aria-label="Live typing capture — keystrokes are sent to the TV"
+        aria-label="Live typing capture — keystrokes and pasted text are sent to the TV"
         onkeydown={remoteKeydown}
+        onpaste={remotePaste}
         onfocus={() => (remoteCaptureFocused = true)}
         onblur={() => (remoteCaptureFocused = false)}
       >
@@ -278,6 +344,21 @@
     align-items: flex-start;
   }
   .remote-typing { flex: 1; min-width: 280px; max-width: 480px; }
+  .typing-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .typing-header h3 {
+    margin: 0;
+  }
+  /* Same shape as the small actions in the Files and Install APK tabs; Svelte
+     scopes styles per component, so it is redeclared rather than inherited. */
+  .small-action {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.78rem;
+  }
   .type-capture {
     min-height: 3.2rem;
     padding: 0.8rem;

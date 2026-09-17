@@ -126,6 +126,13 @@ whether this build works for you.
   instead of reporting "No matches, export from the app first" and sending you
   to redo an export that already worked.
 
+### Remote
+
+- **You can paste into the Remote box now** (#91). Use ⌘V / Ctrl+V with the
+  typing area focused, or the new Paste button. The whole clipboard goes over
+  in one shot rather than a character at a time, and line breaks arrive as
+  Enter — which makes a long URL or password bearable.
+
 ### Updates
 
 - **See what an update changes before it installs.** Update now opens the
