@@ -126,6 +126,22 @@ jobs:
         working-directory: v2
         run: npm run test:sideload-scan
 
+      # One device reached two ways is one row; a phone says so and doesn't
+      # open the TV tools; a network device isn't told to find a USB dialog.
+      - name: Device list rows
+        working-directory: v2
+        run: npm run test:device-list-rows
+
+      # Release notes are remote Markdown from the updater manifest: they must
+      # render before an update installs, and must never become markup.
+      - name: Release notes parser
+        working-directory: v2
+        run: npm run test:release-notes
+
+      - name: Update notes dialog
+        working-directory: v2
+        run: npm run test:update-notes-dialog
+
       - name: Playback and expert shell regressions
         working-directory: v2
         run: npm run test:playback-shell

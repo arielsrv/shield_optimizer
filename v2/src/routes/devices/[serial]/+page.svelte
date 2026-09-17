@@ -1525,7 +1525,8 @@
       {:else}
         <p class="muted small">
           This device hasn't reported its details. It's usually still waiting on
-          the "Allow USB debugging?" prompt on the TV.
+          the debugging authorization prompt on the TV — over the network some
+          TVs still title that "Allow USB debugging?".
         </p>
       {/if}
 

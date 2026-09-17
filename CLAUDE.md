@@ -40,6 +40,12 @@ The mobile companion app (`v2/mobile/`) has its own authoritative handoff at
 certainty than it has: saved TVs are matched on verified hardware id and never on IP address
 alone, and uncatalogued packages are labeled Unknown rather than Safe. Preserve that.
 
+**That identity rule is repo-wide, not mobile-only.** Desktop collapses duplicate adb transports
+on `ro.serialno` and on nothing else — two rows are never merged because their addresses look
+related, and a device that cannot be queried (unauthorized, so no id) always keeps its own row.
+The same applies to device *type*: a device is only called "not an Android TV" when it actually
+reported that it isn't. Unreadable means unknown, and unknown claims nothing.
+
 ## v2 architecture invariants
 
 These are load-bearing — break them and the safety story falls over.

@@ -6,7 +6,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::adb::{
-    local_subnet_prefix, parse_mdns_services, scan_subnet, AdbDriver, MdnsService, ADB_NETWORK_PORT,
+    local_subnet_prefix, parse_device_list, parse_mdns_services, scan_subnet, AdbDriver,
+    MdnsService, ADB_NETWORK_PORT,
 };
 
 use super::AppState;
@@ -21,7 +22,7 @@ pub struct ScanResult {
     /// IPs that `adb connect` succeeded against.
     pub connected: Vec<String>,
     /// IPs the daemon reached but that haven't authorized this computer's ADB
-    /// key — the device shows an "Allow USB debugging?" prompt and registers
+    /// key — the device shows a debugging authorization prompt and registers
     /// as `unauthorized` in the device list.
     pub unauthorized: Vec<String>,
     /// IPs that responded to the port probe but `adb connect` failed.
@@ -84,17 +85,53 @@ struct ScanTargets {
 /// port, so when a host advertises one we use it and drop the swept `:5555`
 /// guess for that same host. Legacy devices (Shield with Network debugging)
 /// advertise `_adb._tcp` on 5555 or nothing at all, and keep working either way.
-fn merge_scan_targets(swept_ips: &[String], services: &[MdnsService]) -> ScanTargets {
+/// Would dialling this service hand adb a *second* key for a device it already
+/// holds?
+///
+/// adb auto-connects an already-paired mDNS device by itself and keys that
+/// transport by the *service name*, e.g.
+/// `adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp`. The advertisement gives
+/// us the instance, `adb-58040DLCH005YV-jBeCEe`, so the attached serial is the
+/// instance plus a dot-prefixed service suffix. Connecting the same device
+/// again by `host:port` registers a second transport under a different key,
+/// which is how one device came to occupy two rows.
+///
+/// Deliberately *not* checked here: a device already attached under the very
+/// endpoint we would dial. That reconnect is a no-op adb answers with "already
+/// connected to …", it cannot produce a second transport, and skipping it
+/// would drop the device out of the scan's connected count — telling a user
+/// their TV was not found when it is sitting right there.
+fn would_duplicate_transport(service: &MdnsService, attached: &[String]) -> bool {
+    let instance_prefix = format!("{}.", service.instance);
+    let endpoint = service.endpoint();
+    attached
+        .iter()
+        .filter(|serial| *serial != &endpoint)
+        .any(|serial| serial == &service.instance || serial.starts_with(&instance_prefix))
+}
+
+fn merge_scan_targets(
+    swept_ips: &[String],
+    services: &[MdnsService],
+    attached: &[String],
+) -> ScanTargets {
     let mut connect: Vec<String> = Vec::new();
     let mut advertised_hosts: Vec<&str> = Vec::new();
 
     for service in services.iter().filter(|s| s.is_connectable()) {
+        // The host still counts as spoken-for either way, so the `:5555` sweep
+        // below does not guess at a device that told us its real port.
+        if !advertised_hosts.contains(&service.host.as_str()) {
+            advertised_hosts.push(&service.host);
+        }
+        // Reconnecting under a second key gains nothing and costs a duplicate
+        // row.
+        if would_duplicate_transport(service, attached) {
+            continue;
+        }
         let endpoint = service.endpoint();
         if !connect.contains(&endpoint) {
             connect.push(endpoint);
-        }
-        if !advertised_hosts.contains(&service.host.as_str()) {
-            advertised_hosts.push(&service.host);
         }
     }
 
@@ -125,6 +162,19 @@ fn merge_scan_targets(swept_ips: &[String], services: &[MdnsService]) -> ScanTar
     ScanTargets {
         connect,
         needs_pairing,
+    }
+}
+
+/// Serials adb currently holds a transport for. Used to avoid handing adb a
+/// second key for a device it is already attached to. Same read as
+/// `commands/install.rs` performs around a daemon restart.
+async fn attached_serials(adb: &dyn AdbDriver) -> Vec<String> {
+    match adb.raw(&["devices"]).await {
+        Ok(out) => parse_device_list(&out.stdout)
+            .into_iter()
+            .map(|entry| entry.serial)
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -171,9 +221,12 @@ pub async fn scan_network(state: State<'_, AppState>) -> Result<ScanResult, Stri
     // a single retry below, makes the scan connect on its own.
     let _ = adb.raw(&["start-server"]).await;
 
-    // The daemon has to be up before it can report what it has browsed.
+    // The daemon has to be up before it can report what it has browsed --
+    // and starting it is also what makes adb auto-connect the mDNS devices it
+    // already trusts, so read the attached list only after this point.
     let services = discover_mdns_services(adb.as_ref()).await;
-    let targets = merge_scan_targets(&swept, &services);
+    let attached = attached_serials(adb.as_ref()).await;
+    let targets = merge_scan_targets(&swept, &services, &attached);
 
     let found: Vec<String> = targets
         .connect
@@ -240,8 +293,8 @@ fn summary_message(
     );
     if !unauthorized.is_empty() {
         message.push_str(&format!(
-            " {} need{} authorization — accept the \"Allow USB debugging?\" prompt on the \
-             TV, then Refresh.",
+            " {} need{} authorization — accept the debugging prompt on the TV, then \
+             Refresh.",
             unauthorized.len(),
             if unauthorized.len() == 1 { "s" } else { "" }
         ));
@@ -282,7 +335,7 @@ mod tests {
             41541,
         )];
 
-        let targets = merge_scan_targets(&[], &services);
+        let targets = merge_scan_targets(&[], &services, &[]);
 
         assert_eq!(targets.connect, vec!["192.168.42.211:41541"]);
         assert!(targets.needs_pairing.is_empty());
@@ -300,7 +353,7 @@ mod tests {
         )];
         let swept = vec!["192.168.42.211".to_string(), "192.168.42.71".to_string()];
 
-        let targets = merge_scan_targets(&swept, &services);
+        let targets = merge_scan_targets(&swept, &services, &[]);
 
         assert_eq!(
             targets.connect,
@@ -312,7 +365,7 @@ mod tests {
     #[test]
     fn legacy_devices_still_reach_5555_when_nothing_is_advertised() {
         // The Shield path, unchanged: no mDNS, swept on the standard port.
-        let targets = merge_scan_targets(&["192.168.42.71".to_string()], &[]);
+        let targets = merge_scan_targets(&["192.168.42.71".to_string()], &[], &[]);
 
         assert_eq!(targets.connect, vec!["192.168.42.71:5555"]);
         assert!(targets.needs_pairing.is_empty());
@@ -329,7 +382,7 @@ mod tests {
             37199,
         )];
 
-        let targets = merge_scan_targets(&[], &services);
+        let targets = merge_scan_targets(&[], &services, &[]);
 
         assert!(targets.connect.is_empty());
         assert_eq!(targets.needs_pairing, vec!["192.168.42.211:37199"]);
@@ -353,7 +406,7 @@ mod tests {
             ),
         ];
 
-        let targets = merge_scan_targets(&[], &services);
+        let targets = merge_scan_targets(&[], &services, &[]);
 
         assert_eq!(targets.connect, vec!["192.168.42.211:41541"]);
         assert!(targets.needs_pairing.is_empty());
@@ -366,9 +419,161 @@ mod tests {
             service("a", crate::adb::MDNS_SERVICE_LEGACY, "192.168.42.71", 5555),
         ];
 
-        let targets = merge_scan_targets(&["192.168.42.71".to_string()], &services);
+        let targets = merge_scan_targets(&["192.168.42.71".to_string()], &services, &[]);
 
         assert_eq!(targets.connect, vec!["192.168.42.71:5555"]);
+    }
+
+    /// The regression this whole layer exists for. adb auto-connects a paired
+    /// mDNS device under its service name; connecting the same device again by
+    /// host:port makes adb register a second transport, and the device list
+    /// faithfully renders both.
+    #[test]
+    fn a_device_adb_already_holds_is_not_connected_a_second_time() {
+        let services = vec![service(
+            "adb-58040DLCH005YV-jBeCEe",
+            crate::adb::MDNS_SERVICE_CONNECT,
+            "192.168.42.211",
+            34083,
+        )];
+        let attached = vec!["adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp".to_string()];
+
+        let targets = merge_scan_targets(&[], &services, &attached);
+
+        assert!(
+            targets.connect.is_empty(),
+            "reconnecting by host:port is what creates the duplicate: {:?}",
+            targets.connect
+        );
+        assert!(targets.needs_pairing.is_empty());
+    }
+
+    #[test]
+    fn an_advertised_host_adb_already_holds_is_still_not_probed_on_5555() {
+        // Skipping the connect must not also forfeit the knowledge that this
+        // host told us its real port -- otherwise the sweep guesses :5555 for
+        // a device we already know is somewhere else.
+        let services = vec![service(
+            "adb-tv",
+            crate::adb::MDNS_SERVICE_CONNECT,
+            "192.168.42.211",
+            34083,
+        )];
+        let attached = vec!["adb-tv._adb-tls-connect._tcp".to_string()];
+
+        let targets = merge_scan_targets(&["192.168.42.211".to_string()], &services, &attached);
+
+        assert!(targets.connect.is_empty(), "{:?}", targets.connect);
+    }
+
+    #[test]
+    fn a_device_attached_at_the_very_endpoint_we_would_dial_is_still_dialled() {
+        // Redialling the same key cannot duplicate anything — adb just says
+        // "already connected". Skipping it would drop the device from the
+        // scan's connected count and read as "your TV wasn't found".
+        let services = vec![service(
+            "adb-tv",
+            crate::adb::MDNS_SERVICE_CONNECT,
+            "192.168.42.211",
+            34083,
+        )];
+        let attached = vec!["192.168.42.211:34083".to_string()];
+
+        let targets = merge_scan_targets(&[], &services, &attached);
+
+        assert_eq!(targets.connect, vec!["192.168.42.211:34083"]);
+    }
+
+    #[test]
+    fn a_device_adb_does_not_hold_is_still_connected() {
+        // The #88 fix has to survive this layer: an advertised device adb has
+        // never seen must still be dialled at its real port.
+        let services = vec![service(
+            "adb-new-tv",
+            crate::adb::MDNS_SERVICE_CONNECT,
+            "192.168.42.211",
+            34083,
+        )];
+        let attached = vec!["adb-some-other-device._adb-tls-connect._tcp".to_string()];
+
+        let targets = merge_scan_targets(&[], &services, &attached);
+
+        assert_eq!(targets.connect, vec!["192.168.42.211:34083"]);
+    }
+
+    #[test]
+    fn a_similar_instance_name_is_not_treated_as_the_same_device() {
+        // Prefix matching must stop at the dot. `adb-tv-2` is not `adb-tv`.
+        let services = vec![service(
+            "adb-tv",
+            crate::adb::MDNS_SERVICE_CONNECT,
+            "192.168.42.211",
+            34083,
+        )];
+        let attached = vec!["adb-tv-2._adb-tls-connect._tcp".to_string()];
+
+        let targets = merge_scan_targets(&[], &services, &attached);
+
+        assert_eq!(targets.connect, vec!["192.168.42.211:34083"]);
+    }
+
+    #[test]
+    fn legacy_sweep_targets_are_unaffected_by_the_attached_list() {
+        // A Shield on Network debugging advertises nothing and is swept. Being
+        // attached under its own ip:port key is the normal steady state and
+        // must not stop the scan reporting it.
+        let targets = merge_scan_targets(
+            &["192.168.42.196".to_string()],
+            &[],
+            &["192.168.42.196:5555".to_string()],
+        );
+
+        assert_eq!(targets.connect, vec!["192.168.42.196:5555"]);
+    }
+
+    /// End-to-end over output captured verbatim from a real LAN while the
+    /// duplicate was reproducing: a phone adb had auto-connected over mDNS,
+    /// a Shield on legacy network debugging, and three unauthorized hosts.
+    #[test]
+    fn real_world_scan_output_connects_the_shield_and_leaves_the_phone_alone() {
+        let services = parse_mdns_services(
+            "List of discovered mdns services\n\
+             adb-58040DLCH005YV-jBeCEe\t_adb-tls-connect._tcp\t192.168.42.211:34083\n\
+             adb-1324619053514\t_adb._tcp\t192.168.42.196:5555\n\
+             adb-1321920044953\t_adb._tcp\t192.168.42.143:5555\n",
+        );
+        let attached: Vec<String> = parse_device_list(
+            "List of devices attached\n\
+             192.168.42.143:5555\tunauthorized\n\
+             192.168.42.196:5555\tdevice\n\
+             adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp\tdevice\n",
+        )
+        .into_iter()
+        .map(|e| e.serial)
+        .collect();
+        let swept = vec![
+            "192.168.42.143".to_string(),
+            "192.168.42.196".to_string(),
+            "192.168.42.25".to_string(),
+        ];
+
+        let targets = merge_scan_targets(&swept, &services, &attached);
+
+        assert!(
+            !targets
+                .connect
+                .iter()
+                .any(|t| t.starts_with("192.168.42.211")),
+            "the phone is already attached under its mDNS name: {:?}",
+            targets.connect
+        );
+        // Everything else still gets dialled, including a host adb already
+        // holds under the same ip:port key -- reconnecting that is a no-op for
+        // adb and keeps the scan's "connected" count honest.
+        assert!(targets.connect.contains(&"192.168.42.196:5555".to_string()));
+        assert!(targets.connect.contains(&"192.168.42.143:5555".to_string()));
+        assert!(targets.connect.contains(&"192.168.42.25:5555".to_string()));
+        assert!(targets.needs_pairing.is_empty());
     }
 
     #[test]
@@ -454,7 +659,7 @@ mod tests {
         assert_eq!(
             msg,
             "Scanned 192.168.42.x — found 4 devices, connected 0. 2 need authorization — \
-             accept the \"Allow USB debugging?\" prompt on the TV, then Refresh."
+             accept the debugging prompt on the TV, then Refresh."
         );
     }
 

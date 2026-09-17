@@ -163,8 +163,13 @@ aligned, never fork it*.
     malformed records, `adb-…` instance names, legacy vs TLS ports). A saved endpoint whose address
     answered the scan on a different port reports `saved-other-port` ("This address answered on
     another port") instead of claiming it was not found — a rotated wireless-debugging port is not
-    evidence the TV is offline. Desktop was checked and is not affected: it enumerates devices
-    through the adb binary's own serials and keeps no saved-network-device list. Mobile gates:
+    evidence the TV is offline. Desktop was checked and judged unaffected at the time: it
+    enumerates devices through the adb binary's own serials and keeps no saved-network-device
+    list. That premise was right and the conclusion was wrong — "no saved list" meant "no dedupe
+    mechanism", not "immune". Once desktop discovery began dialling mDNS-advertised endpoints,
+    adb held two transports for one device and the desktop list faithfully rendered both. Desktop
+    now collapses rows on verified hardware id, using the same identity rule as this app. Mobile
+    gates:
     tests 78/78, check 0 errors/0 warnings, build passed. Physical device verification of the
     reconnect flow is still the open gate on the parent bead.
   - **Code pairing (SPAKE2) — implemented, unverified on a device.** Clean-room Rust in the

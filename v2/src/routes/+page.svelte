@@ -131,8 +131,32 @@
     }
   }
 
+  /// Do we positively know this is not an Android TV?
+  ///
+  /// `detect_device_type` only falls through to Unknown when the device did
+  /// *not* report the `tv` characteristic — a TV we don't recognise still
+  /// self-reports and classifies as Google TV. So Unknown plus readable
+  /// properties means "definitely something else", such as a phone.
+  /// Properties we could not read (an unauthorized device) mean we don't know
+  /// yet, and we say nothing.
+  function isNotATv(d: Device): boolean {
+    return d.device_type === "unknown" && d.properties !== null;
+  }
+
   function deviceHref(d: Device): string | null {
+    // The device tools are all Android TV operations; pointing them at a phone
+    // is at best useless. Still listed, just not opened.
+    if (isNotATv(d)) return null;
     return d.status === "device" ? `/devices/${encodeURIComponent(d.serial)}` : null;
+  }
+
+  /// What the authorization prompt is called on this device.
+  ///
+  /// Over USB it is reliably "Allow USB debugging?". Over the network the
+  /// title varies by Android version and OEM — plenty of TVs still show the
+  /// USB wording for a Wi-Fi connection — so don't swear to one.
+  function authPromptLabel(d: Device): string {
+    return d.connection === "usb" ? '"Allow USB debugging?"' : '"Allow debugging?"';
   }
 
   async function pair() {
@@ -368,6 +392,9 @@
                 {:else if d.status === "offline"}
                   <span class="status-tag offline">OFFLINE</span>
                 {/if}
+                {#if isNotATv(d)}
+                  <span class="status-tag not-a-tv">NOT AN ANDROID TV</span>
+                {/if}
               </div>
               <div class="device-meta muted">
                 {deviceTypeLabel(d.device_type)}
@@ -378,14 +405,21 @@
                 <div class="unauthorized-help">
                   <strong>This device needs to be authorized:</strong>
                   <ol>
-                    <li>Look at the TV — there should be an <em>"Allow USB debugging?"</em> dialog.</li>
+                    <li>
+                      Look at the TV — there should be an <em>{authPromptLabel(d)}</em> dialog.
+                      {#if d.connection === "network"}
+                        <span class="muted">(some TVs still say "USB" even over Wi-Fi)</span>
+                      {/if}
+                    </li>
                     <li>Check <em>"Always allow from this computer"</em>.</li>
                     <li>Click <em>Allow</em>.</li>
                     <li>Click Refresh above.</li>
                   </ol>
                   <p class="muted small">
                     If you don't see the dialog, run <code>adb disconnect {d.serial}</code> from a terminal,
-                    then on the TV go to Developer options → Revoke USB debugging authorizations, and reconnect.
+                    then on the TV go to Developer options → Revoke USB debugging authorizations
+                    {#if d.connection === "network"}(or Wireless debugging → Forget, on Android 11+){/if},
+                    and reconnect.
                   </p>
                 </div>
               {/if}
@@ -474,6 +508,12 @@
     color: var(--danger-text);
   }
   .status-tag.offline {
+    background: var(--bg-muted);
+    color: var(--fg-faint);
+  }
+  /* Informational, not a problem — this device is simply not what the app is
+     for. Deliberately quieter than the warning tags above it. */
+  .status-tag.not-a-tv {
     background: var(--bg-muted);
     color: var(--fg-faint);
   }

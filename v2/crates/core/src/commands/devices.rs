@@ -80,7 +80,79 @@ pub async fn list_devices_impl(state: &AppState) -> Result<Vec<Device>, String> 
         });
     }
 
-    Ok(out)
+    Ok(renumber(collapse_duplicate_transports(out)))
+}
+
+/// `ro.serialno`, or `None` when the device gave us nothing to identify it by.
+///
+/// Empty and the literal `"unknown"` are both "no evidence" — some builds
+/// report the latter rather than leaving the prop unset, and treating it as an
+/// identity would merge every such device into one row.
+fn hardware_id(device: &Device) -> Option<&str> {
+    let id = device.properties.as_ref()?.serial_number.trim();
+    if id.is_empty() || id.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    Some(id)
+}
+
+/// Collapse rows that are the same physical device reached two ways.
+///
+/// adb happily holds two transports for one device — it auto-connects a paired
+/// mDNS device under its service name, and anything that also dials the same
+/// device by `host:port` gets a second transport under a different key. Both
+/// are real and both work; they are simply not two devices.
+///
+/// Identity is the verified hardware id and nothing else. Two rows are never
+/// merged because their addresses look related — that is the repo-wide rule
+/// the mobile app states as "matched on verified hardware id and never on IP
+/// address alone", and it is why an unauthorized device (which cannot be
+/// queried, so has no id) always keeps its own row.
+///
+/// The surviving row keeps the `ip:port` serial when one of the pair has it:
+/// it is readable, it is what a user would type into Connect IP, and `adb -s`
+/// accepts it just as well as the service name.
+fn collapse_duplicate_transports(devices: Vec<Device>) -> Vec<Device> {
+    let mut out: Vec<Device> = Vec::with_capacity(devices.len());
+
+    for device in devices {
+        let Some(id) = hardware_id(&device) else {
+            // No evidence of identity: it stands alone.
+            out.push(device);
+            continue;
+        };
+        let existing = out
+            .iter_mut()
+            .find(|kept| hardware_id(kept) == Some(id) && kept.status == device.status);
+        match existing {
+            Some(kept) => {
+                // Prefer the address a person can act on. `is_ip_port` rather
+                // than "not ._tcp" so a USB serial never displaces one.
+                if !is_ip_port(&kept.serial) && is_ip_port(&device.serial) {
+                    kept.serial = device.serial;
+                    kept.connection = device.connection;
+                }
+            }
+            None => out.push(device),
+        }
+    }
+
+    out
+}
+
+fn is_ip_port(serial: &str) -> bool {
+    match serial.rsplit_once(':') {
+        Some((host, port)) => port.parse::<u16>().is_ok() && host.split('.').count() == 4,
+        None => false,
+    }
+}
+
+/// `id` is a 1-based menu index, so it has to stay contiguous after a merge.
+fn renumber(mut devices: Vec<Device>) -> Vec<Device> {
+    for (idx, device) in devices.iter_mut().enumerate() {
+        device.id = (idx + 1) as u32;
+    }
+    devices
 }
 
 /// `device_profile` — return the same payload `list_devices` would for a single
@@ -612,6 +684,157 @@ mod tests {
         // neighbour's value.
         assert_eq!(props.build_id, "");
         assert_eq!(props.serial_number, "");
+    }
+
+    fn row(serial: &str, hardware_id: &str) -> Device {
+        Device {
+            id: 0,
+            serial: serial.to_string(),
+            name: "TV".into(),
+            model: "TV".into(),
+            device_type: DeviceType::Unknown,
+            status: DeviceStatus::Device,
+            connection: crate::engine::types::ConnectionType::Network,
+            properties: Some(DeviceProperties {
+                serial_number: hardware_id.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn unidentified(serial: &str) -> Device {
+        Device {
+            id: 0,
+            serial: serial.to_string(),
+            name: serial.to_string(),
+            model: String::new(),
+            device_type: DeviceType::Unknown,
+            status: DeviceStatus::Unauthorized,
+            connection: crate::engine::types::ConnectionType::Network,
+            properties: None,
+        }
+    }
+
+    #[test]
+    fn one_device_reached_two_ways_collapses_to_the_usable_address() {
+        // The live regression: adb auto-connected the device under its mDNS
+        // service name, and the scan then dialled the same device by address.
+        let devices = vec![
+            row(
+                "adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp",
+                "58040DLCH005YV",
+            ),
+            row("192.168.42.211:34083", "58040DLCH005YV"),
+        ];
+
+        let collapsed = renumber(collapse_duplicate_transports(devices));
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].serial, "192.168.42.211:34083");
+        assert_eq!(collapsed[0].id, 1);
+    }
+
+    #[test]
+    fn the_service_name_survives_when_it_is_the_only_transport() {
+        let devices = vec![row(
+            "adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp",
+            "58040DLCH005YV",
+        )];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(
+            collapsed[0].serial,
+            "adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp"
+        );
+    }
+
+    #[test]
+    fn a_usb_serial_is_never_displaced_by_an_address() {
+        // A device on USB and network at once keeps the USB row's serial only
+        // if the address form does not exist; here it does, and the address is
+        // the one a person can retype. The point of the assertion is that the
+        // *USB* serial is not mistaken for an address by is_ip_port.
+        assert!(!is_ip_port("0323220012345"));
+        assert!(!is_ip_port(
+            "adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp"
+        ));
+        assert!(is_ip_port("192.168.42.211:34083"));
+        assert!(!is_ip_port("192.168.42.211"));
+        assert!(!is_ip_port("192.168.42:5555"));
+    }
+
+    #[test]
+    fn different_hardware_ids_stay_separate_however_alike_the_addresses_look() {
+        let devices = vec![
+            row("192.168.42.211:34083", "AAAAAAA"),
+            row("192.168.42.211:5555", "BBBBBBB"),
+        ];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(collapsed.len(), 2, "two TVs at one address are two TVs");
+    }
+
+    #[test]
+    fn devices_without_an_id_are_never_merged_into_each_other() {
+        // Unauthorized devices cannot be queried, so there is no evidence they
+        // are the same device. Merging on address alone is exactly the claim
+        // the repo's identity rule forbids.
+        let devices = vec![
+            unidentified("192.168.42.143:5555"),
+            unidentified("adb-mystery._adb-tls-connect._tcp"),
+        ];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(collapsed.len(), 2);
+    }
+
+    #[test]
+    fn an_identified_device_never_absorbs_an_unidentified_one() {
+        let devices = vec![
+            row("192.168.42.211:34083", "58040DLCH005YV"),
+            unidentified("adb-58040DLCH005YV-jBeCEe._adb-tls-connect._tcp"),
+        ];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "an unauthorized row has no verified id, so it cannot be merged"
+        );
+    }
+
+    #[test]
+    fn placeholder_hardware_ids_are_not_identities() {
+        // Some builds answer `unknown` rather than leaving ro.serialno unset.
+        // Treating that as an id would fold every such device into one row.
+        let devices = vec![
+            row("192.168.42.1:5555", "unknown"),
+            row("192.168.42.2:5555", "Unknown"),
+            row("192.168.42.3:5555", "   "),
+        ];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(collapsed.len(), 3);
+        assert!(collapsed.iter().all(|d| hardware_id(d).is_none()));
+    }
+
+    #[test]
+    fn a_disconnected_twin_does_not_merge_with_a_live_one() {
+        // Same hardware, but one transport is offline. Collapsing them would
+        // report a dead endpoint as reachable.
+        let mut offline = row("192.168.42.211:5555", "58040DLCH005YV");
+        offline.status = DeviceStatus::Offline;
+        let devices = vec![row("192.168.42.211:34083", "58040DLCH005YV"), offline];
+
+        let collapsed = collapse_duplicate_transports(devices);
+
+        assert_eq!(collapsed.len(), 2);
     }
 
     #[tokio::test]

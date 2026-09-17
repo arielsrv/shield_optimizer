@@ -7,6 +7,7 @@
   import { getThemePref, setThemePref, type ThemePref } from "$lib/theme";
   import { getAutoUpdate, setAutoUpdate } from "$lib/prefs";
   import { api } from "$lib/api";
+  import { parseReleaseNotes, type NoteBlock } from "$lib/release-notes";
   import type { UpdateInfo } from "$lib/types";
 
   let { children } = $props();
@@ -18,6 +19,18 @@
   let updateBusy = $state(false);
   let updateInstalled = $state(false);
   let updateProgress = $state("");
+  /// Notes for the pending update, shown before it installs. This app disables
+  /// packages on a user's TV and can update itself unattended, so "what does
+  /// this change?" is a question worth answering before the answer arrives.
+  let notesOpen = $state(false);
+  const releaseNotes = $derived<NoteBlock[]>(
+    pendingUpdate?.body ? parseReleaseNotes(pendingUpdate.body) : [],
+  );
+  /// The version being installed comes from the updater manifest, the same
+  /// place the notes do. `update.latest` is a separate GitHub API read and the
+  /// two can disagree — showing one version's number above another's notes
+  /// would be worse than showing neither.
+  const pendingVersion = $derived(pendingUpdate?.version ?? update?.latest ?? "");
 
   onMount(() => {
     theme = getThemePref();
@@ -75,6 +88,15 @@
     }
   }
 
+  function openNotes() {
+    notesOpen = true;
+  }
+
+  async function installFromNotes() {
+    notesOpen = false;
+    await installUpdate();
+  }
+
   function toggleAutoUpdate() {
     autoUpdate = !autoUpdate;
     setAutoUpdate(autoUpdate);
@@ -98,7 +120,13 @@
       <span class="logo-dot"></span>
       <span class="title">Shield Optimizer</span>
       {#if update}
-        <span class="version" title="Installed version">v{update.current}</span>
+        <button
+          class="version"
+          onclick={() => openUrl(update!.url)}
+          title="Installed version — open the release history on GitHub"
+        >
+          v{update.current}
+        </button>
         {#if pendingUpdate}
           {#if updateInstalled}
             <button class="update-badge installed" onclick={restartApp} title="Relaunch to finish updating">
@@ -107,8 +135,8 @@
           {:else if updateBusy}
             <span class="update-badge updating">{updateProgress}</span>
           {:else}
-            <button class="update-badge" onclick={installUpdate} title="Download and install now">
-              Update now → v{update.latest}
+            <button class="update-badge" onclick={openNotes} title="See what changed, then install">
+              Update now → v{pendingVersion}
             </button>
           {/if}
         {:else if update.update_available}
@@ -154,6 +182,62 @@
     </button>
   </footer>
 </div>
+
+{#if notesOpen && update}
+  <!-- Blocks come from `parseReleaseNotes`, which returns data rather than
+       markup. Everything below is rendered through the template, so remote
+       text cannot become HTML. -->
+  <div class="notes-backdrop" role="presentation" onclick={() => (notesOpen = false)}></div>
+  <div class="notes-dialog" role="dialog" aria-modal="true" aria-labelledby="notes-title">
+    <h2 id="notes-title">What's new in v{pendingVersion}</h2>
+    <p class="notes-current muted">You're on v{update.current}.</p>
+    <div class="notes-body">
+      {#if releaseNotes.length === 0}
+        <p class="muted">
+          This release didn't come with notes. The release history on GitHub has
+          the details.
+        </p>
+      {:else}
+        {#each releaseNotes as block, i (i)}
+          {#if block.kind === "heading"}
+            <h3>{#each block.spans as span}{span.text}{/each}</h3>
+          {:else if block.kind === "item"}
+            <p class="notes-item">
+              <span class="notes-bullet">•</span>
+              <span>
+                {#each block.spans as span}
+                  {#if span.href}
+                    <button class="notes-link" onclick={() => openUrl(span.href!)}>{span.text}</button>
+                  {:else if span.bold}<strong>{span.text}</strong>
+                  {:else if span.code}<code>{span.text}</code>
+                  {:else}{span.text}{/if}
+                {/each}
+              </span>
+            </p>
+          {:else}
+            <p>
+              {#each block.spans as span}
+                {#if span.href}
+                  <button class="notes-link" onclick={() => openUrl(span.href!)}>{span.text}</button>
+                {:else if span.bold}<strong>{span.text}</strong>
+                {:else if span.code}<code>{span.text}</code>
+                {:else}{span.text}{/if}
+              {/each}
+            </p>
+          {/if}
+        {/each}
+      {/if}
+    </div>
+    <div class="notes-actions">
+      <button class="notes-history" onclick={() => openUrl(update!.url)}>
+        All releases ↗
+      </button>
+      <span class="spacer"></span>
+      <button onclick={() => (notesOpen = false)}>Not now</button>
+      <button class="primary" onclick={installFromNotes}>Install v{pendingVersion}</button>
+    </div>
+  </div>
+{/if}
 
 <style>
   /* Semantic color tokens. Dark is the default (in :root); light values are
@@ -370,6 +454,106 @@
     font-weight: 500;
     font-size: 0.9rem;
     font-family: ui-monospace, monospace;
+  }
+  button.version {
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+  }
+  button.version:hover {
+    color: var(--fg);
+    text-decoration: underline;
+  }
+
+  .notes-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 10;
+  }
+  .notes-dialog {
+    position: fixed;
+    z-index: 11;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(38rem, calc(100vw - 3rem));
+    max-height: min(34rem, calc(100vh - 4rem));
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 1.25rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+  .notes-dialog h2 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .notes-current {
+    margin: 0;
+    font-size: 0.85rem;
+  }
+  .notes-body {
+    overflow-y: auto;
+    padding-right: 0.25rem;
+    line-height: 1.5;
+  }
+  .notes-body h3 {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--fg-muted);
+    margin: 1rem 0 0.35rem;
+  }
+  .notes-body h3:first-child {
+    margin-top: 0;
+  }
+  .notes-body p {
+    margin: 0 0 0.4rem;
+  }
+  .notes-item {
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+  .notes-bullet {
+    color: var(--fg-faint);
+    flex: none;
+  }
+  .notes-body code {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85em;
+    background: var(--bg-muted);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+  /* A button, not an anchor: these open in the system browser via the opener
+     plugin, and the href is remote text we only partly trust. */
+  .notes-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .notes-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding-top: 0.25rem;
+    border-top: 1px solid var(--border);
+  }
+  .notes-actions .spacer {
+    flex: 1;
+  }
+  .notes-history {
+    font-size: 0.85rem;
   }
   .update-badge {
     margin-left: 0.6rem;

@@ -48,6 +48,16 @@ build works for you.
   step fails (#88).
 - Connect IP accepts an mDNS service name and an IPv6 endpoint, so you can
   paste back what the scan showed you.
+- **One TV is one row.** ADB connects a paired device it finds over mDNS by
+  itself, so scanning could attach the same device a second time by address and
+  list it twice. The scan now skips anything ADB already holds, and the list
+  collapses any duplicates it still finds — matching on the device's hardware
+  id, never on its address.
+- Devices that report they are not an Android TV (a phone, say) are labelled as
+  such and no longer open the TV tools. A device that hasn't reported anything
+  yet is left alone — unreadable means unknown, not "not a TV".
+- A device connected over the network is no longer told to look for an
+  "Allow USB debugging?" dialog.
 - For the record: there is no minimum or maximum Android version anywhere in
   this app, and there never was.
 
@@ -84,6 +94,13 @@ build works for you.
 - A search that could not run — because the TV stopped answering — now says so,
   instead of reporting "No matches, export from the app first" and sending you
   to redo an export that already worked.
+
+### Updates
+
+- **See what an update changes before it installs.** Update now opens the
+  release notes with Install / Not now, instead of taking your word for it from
+  a version number alone. The version in the header opens the full release
+  history.
 
 ### Device information
 
